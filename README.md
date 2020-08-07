@@ -2,7 +2,53 @@
 一键安装配置 v2ray
 
 # Usage
+
 `wget https://raw.githubusercontent.com/afret0/v2ray/master/onekey_v2ray.sh && chmod +x onekey_v2ray.sh && ./onekey_v2ray.sh`
+
+# server
+
+## v2ray
+```json
+{
+    "inbounds":[
+      {
+        "port":10000,
+        "listen":"127.0.0.1",
+        "protocol":"vmess",
+        "settings":{
+          "clients":[
+            {
+              "id":"888d163a-80d7-4495-b3d1-fcf61fc6b6ce",
+              "alterId":64
+            }
+          ]
+        },
+        "streamSettings":{
+          "network":"ws",
+          "wsSettings":{
+          "path":"/ray"
+          }
+        }
+      }
+    ],
+    "outbounds":[
+      {
+        "protocol":"freedom",
+        "settings":{}
+      }
+    ]
+  }
+```
+## caddy
+```
+domain.me {
+  encode gzip
+  reverse_proxy / https://baidu.com
+  reverse_proxy /ray 127.0.0.1:10000 {
+    header_up -Origin
+  }
+}
+```
 
 # client
 ## clashx
