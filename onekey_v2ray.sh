@@ -9,7 +9,7 @@
 wget -O /etc/v2ray/config.json https://raw.githubusercontent.com/afret0/v2ray/master/config.json
 wget -O /etc/caddy/Caddyfile https://raw.githubusercontent.com/afret0/v2ray/master/Caddyfile
 
-domain="test.domain.com"
+domain="vultr.afreto.xyz"
 sed 's/domain.me/'${domain}'/g' /etc/caddy/Caddyfile
 
 docker pull caddy teddysun/v2ray
