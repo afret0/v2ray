@@ -1,4 +1,4 @@
-bwg.afreto.top {
+domain.me {
   encode gzip
   reverse_proxy / https://baidu.com
   reverse_proxy /ray 127.0.0.1:10000 {
