@@ -24,6 +24,8 @@ if [ -x "$(command -v apt-get)" ]; then
     apt-get install unzip -y
 fi
 
+wget https://raw.githubusercontent.com/afret0/v2ray/master/xray_web.zip
+unzip xray_web.zip
 
 curl -fsSL https://get.docker.com/ -o get-docker.sh
 sh get-docker.sh
@@ -35,3 +37,4 @@ sed -i 's/domain.me/'${domain}'/g' /etc/caddy/Caddyfile
 
 docker run -d --name caddy --restart always --net host -v /etc/caddy:/etc/caddy caddy
 docker run -d --name v2ray --restart always --net host -v /etc/v2ray:/etc/v2ray teddysun/v2ray
+docker cp xray_web caddy:/root
