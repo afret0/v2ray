@@ -14,21 +14,21 @@ vmss + websocket + tls
 {
     "inbounds":[
       {
-        "port":10000,
+        "port":10110,
         "listen":"127.0.0.1",
         "protocol":"vmess",
         "settings":{
           "clients":[
             {
-              "id":"888d163a-80d7-4495-b3d1-fcf61fc6b6ce",
-              "alterId":64
+              "id":"2af23a0b-b9c5-4b42-88bd-5a5e24dc0105",
+              "alterId":0
             }
           ]
         },
         "streamSettings":{
           "network":"ws",
           "wsSettings":{
-          "path":"/ray"
+          "path":"/fire"
           }
         }
       }
@@ -54,8 +54,25 @@ domain.me {
 
 # client
 ## clashx
-```json
-{"name":"bwg","type":"vmess","server":"your.domain.com","port":443,"cipher":"auto","udp":false,"uuid":"888d163a-80d7-4495-b3d1-fcf61fc6b6ce","alterId":64,"network":"ws","ws-path":"/ray","ws-headers":{"Host":"bwg.afreto.top"},"tls":true}
+```yaml
+- name: "vmess"
+    type: vmess
+    server: server
+    port: 443
+    uuid: uuid
+    alterId: 32
+    cipher: auto
+    udp: true
+    tls: true
+    skip-cert-verify: true
+    servername: example.com # priority over wss host
+    network: ws
+    ws-opts:
+      path: /path
+      headers:
+        Host: v2ray.com
+      # max-early-data: 2048
+      # early-data-header-name: Sec-WebSocket-Protocol
 ```
 
 ### v2rayU
@@ -94,9 +111,9 @@ domain.me {
       "protocol": "vmess",
       "streamSettings": {
         "wsSettings": {
-          "path": "/ray",
+          "path": "/fire",
           "headers": {
-            "host": "bwg.afreto.top"
+            "host": "domain.com"
           }
         },
         "tlsSettings": {
@@ -109,11 +126,11 @@ domain.me {
       "settings": {
         "vnext": [
           {
-            "address": "bwg.afreto.top",
+            "address": "domian.com",
             "users": [
               {
-                "id": "888d163a-80d7-4495-b3d1-fcf61fc6b6ce",
-                "alterId": 64,
+                "id": "2af23a0b-b9c5-4b42-88bd-5a5e24dc0105",
+                "alterId": 0,
                 "level": 0,
                 "security": "auto"
               }
