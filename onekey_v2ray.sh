@@ -12,6 +12,11 @@ echo "your domain is "$domain
 wget -P /etc/v2ray https://raw.githubusercontent.com/afret0/v2ray/master/config.json
 wget -P /etc/caddy https://raw.githubusercontent.com/afret0/v2ray/master/Caddyfile
 
+curl -fsSL https://get.docker.com/ -o get-docker.sh
+sh get-docker.sh
+
+systemctl start docker
+
 # domain="vultr.afreto.xyz"
 sed -i 's/domain.me/'${domain}'/g' /etc/caddy/Caddyfile 
 
