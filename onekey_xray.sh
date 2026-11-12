@@ -11,6 +11,17 @@ readonly DEFAULT_PORT="443"
 readonly FLOW="xtls-rprx-vision"
 readonly FINGERPRINT="chrome"
 readonly HEALTH_WAIT_SECONDS=10
+readonly BBR_SYSCTL_FILE="/etc/sysctl.d/99-xray-bbr.conf"
+readonly LOG_MAX_SIZE="10m"
+readonly LOG_MAX_FILE="3"
+readonly WARP_API="https://api.cloudflareclient.com/v0a5641/reg"
+readonly WARP_USER_AGENT="1.1.1.1/6.38.9-5641 (Android 16.0.0)"
+readonly WARP_CLIENT_VERSION="a-6.38.9-5641"
+readonly WARP_MTU=1280
+readonly WARP_TARGET_STRATEGY="ForceIPv4v6"
+readonly WARP_CHECK_CONTAINER="xray-warp-check"
+readonly WARP_CHECK_URL="https://www.cloudflare.com/cdn-cgi/trace"
+readonly -a WARP_DOMAINS=('geosite:category-ai-!cn' 'geosite:netflix' 'geosite:disney')
 
 readonly GREEN=$'\033[0;32m'
 readonly YELLOW=$'\033[1;33m'
@@ -33,6 +44,23 @@ server_ip=""
 vless_link=""
 tmp_config=""
 tmp_get_docker=""
+installed_port=""
+bbr_choice=""
+bbr_status=""
+warp_choice=""
+default_warp="n"
+reuse_warp=false
+warp_enabled=false
+warp_status=""
+warp_failure=""
+warp_secret=""
+warp_v4=""
+warp_v6=""
+warp_reserved=""
+warp_peer=""
+warp_endpoint=""
+warp_check_dir=""
+warp_check_started=false
 
 step() { printf '%s\n' "${GREEN}$*${NC}"; }
 info() { printf '%s\n' "${YELLOW}$*${NC}"; }
@@ -48,6 +76,8 @@ on_error() {
 cleanup() {
     if [ -n "$tmp_config" ]; then rm -f "$tmp_config"; fi
     if [ -n "$tmp_get_docker" ]; then rm -f "$tmp_get_docker"; fi
+    if [ "$warp_check_started" = true ]; then docker rm -f -v "$WARP_CHECK_CONTAINER" >/dev/null 2>&1 || true; fi
+    if [ -n "$warp_check_dir" ]; then rm -rf "$warp_check_dir"; fi
 }
 
 trap '[ "$BASH_SUBSHELL" -eq 0 ] && on_error "$LINENO" "$?" "$BASH_COMMAND"' ERR
@@ -75,6 +105,43 @@ valid_short_id() {
     [[ $1 =~ ^[0-9a-fA-F]{2,16}$ ]] && ((${#1} % 2 == 0))
 }
 
+valid_wg_key() {
+    [[ $1 =~ ^[A-Za-z0-9+/]{43}=$ ]]
+}
+
+valid_ipv4() {
+    [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]
+}
+
+valid_ipv6() {
+    [[ $1 =~ ^[0-9a-fA-F:]+$ ]] && [[ $1 == *:*:* ]]
+}
+
+valid_reserved() {
+    local re='^([0-9]{1,3}),([0-9]{1,3}),([0-9]{1,3})$'
+    [[ $1 =~ $re ]] && ((10#${BASH_REMATCH[1]} <= 255 && 10#${BASH_REMATCH[2]} <= 255 && 10#${BASH_REMATCH[3]} <= 255))
+}
+
+valid_endpoint() {
+    [[ $1 =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]]
+}
+
+parse_yes_no() {
+    case ${1,,} in
+        y | yes | 1 | true | on) printf 'y' ;;
+        n | no | 0 | false | off) printf 'n' ;;
+        *) return 1 ;;
+    esac
+}
+
+on_off() {
+    if [ "$1" = y ]; then
+        printf '开启'
+    else
+        printf '不开启'
+    fi
+}
+
 credential_state() {
     if [ -z "$1" ]; then
         printf '空'
@@ -91,6 +158,14 @@ has_tty() {
 
 json_string() {
     { grep -oE "$2" <<<"$1" || true; } | awk -F'"' 'NR == 1 {print $4}'
+}
+
+first_match() {
+    { grep -oE "$1" <<<"$2" || true; } | head -n 1
+}
+
+decode_reserved() {
+    { printf '%s' "$1" | base64 -d 2>/dev/null || true; } | od -An -tu1 | awk '{for (i = 1; i <= NF; i++) printf "%s%s", (n++ ? "," : ""), $i}'
 }
 
 key_from_output() {
@@ -143,10 +218,13 @@ load_existing_config() {
 
     if valid_port "$old_port"; then
         default_port=$((10#$old_port))
+        installed_port=$default_port
         info "沿用已安装的端口作为默认值: ${default_port}"
     else
         info "已有配置中的端口不合法 (值: ${old_port:-空})，默认值仍为 ${DEFAULT_PORT}"
     fi
+
+    load_existing_warp "$flat"
 
     if valid_uuid "$old_uuid" && valid_key "$old_private_key" && valid_short_id "$old_short_id"; then
         reuse_credentials=true
@@ -154,6 +232,36 @@ load_existing_config() {
         return
     fi
     info "注意: 已有配置中的 UUID / 私钥 / ShortId 不完整 (UUID: $(credential_state "$old_uuid" valid_uuid), 私钥: $(credential_state "$old_private_key" valid_key), ShortId: $(credential_state "$old_short_id" valid_short_id))，将重新生成，旧客户端需重新导入"
+}
+
+load_existing_warp() {
+    local flat=$1 addresses
+    if [[ $flat != *'"protocol":"wireguard"'* ]]; then
+        info "已有配置未开启 WARP，WARP 默认值为不开启"
+        return
+    fi
+    default_warp=y
+    addresses=$(first_match '"address":\[[^]]*\]' "$flat")
+    warp_secret=$(json_string "$flat" '"secretKey":"[^"]*"')
+    warp_v4=$(first_match '[0-9.]+/32' "$addresses")
+    warp_v4=${warp_v4%/32}
+    warp_v6=$(first_match '[0-9a-fA-F:]+/128' "$addresses")
+    warp_v6=${warp_v6%/128}
+    warp_reserved=$(first_match '[0-9]+,[0-9]+,[0-9]+' "$(first_match '"reserved":\[[0-9]+,[0-9]+,[0-9]+\]' "$flat")")
+    warp_peer=$(json_string "$flat" '"publicKey":"[^"]*"')
+    warp_endpoint=$(json_string "$flat" '"endpoint":"[^"]*"')
+    if valid_wg_key "$warp_secret" && valid_ipv4 "$warp_v4" && valid_ipv6 "$warp_v6" && valid_reserved "$warp_reserved" && valid_wg_key "$warp_peer" && valid_endpoint "$warp_endpoint"; then
+        reuse_warp=true
+        info "已有配置开启了 WARP (地址: ${warp_v4}, ${warp_v6})，WARP 默认值沿用为开启，开启时复用该 WARP 账号"
+        return
+    fi
+    info "注意: 已有配置开启了 WARP 但账号信息不完整 (私钥: $(credential_state "$warp_secret" valid_wg_key), IPv4: $(credential_state "$warp_v4" valid_ipv4), IPv6: $(credential_state "$warp_v6" valid_ipv6), reserved: $(credential_state "$warp_reserved" valid_reserved), 对端公钥: $(credential_state "$warp_peer" valid_wg_key), endpoint: $(credential_state "$warp_endpoint" valid_endpoint))，WARP 默认值沿用为开启，开启时重新注册"
+    warp_secret=""
+    warp_v4=""
+    warp_v6=""
+    warp_reserved=""
+    warp_peer=""
+    warp_endpoint=""
 }
 
 choose_sni() {
@@ -197,6 +305,51 @@ choose_port() {
     done
     port=$((10#$port))
     info "监听端口: ${port}"
+}
+
+read_yes_no() {
+    local question=$1 default=$2 hint="y/N" answer
+    if [ "$default" = y ]; then
+        hint="Y/n"
+    fi
+    while true; do
+        read -r -p "${question} [${hint}]: " answer </dev/tty || answer=""
+        answer=${answer:-$default}
+        if parse_yes_no "$answer"; then
+            return
+        fi
+        info "${answer} 不合法，请输入 y 或 n" >&2
+    done
+}
+
+choose_bbr() {
+    if [ -n "${XRAY_BBR:-}" ]; then
+        bbr_choice=$(parse_yes_no "$XRAY_BBR") || fail "环境变量 XRAY_BBR=${XRAY_BBR} 不合法，需为 y 或 n"
+        info "BBR 加速: $(on_off "$bbr_choice") (来自环境变量 XRAY_BBR)"
+        return
+    fi
+    if ! has_tty; then
+        bbr_choice=y
+        info "BBR 加速: 开启 (无交互终端且未设置 XRAY_BBR，取默认值)"
+        return
+    fi
+    bbr_choice=$(read_yes_no "是否开启 BBR 加速" y)
+    info "BBR 加速: $(on_off "$bbr_choice")"
+}
+
+choose_warp() {
+    if [ -n "${XRAY_WARP:-}" ]; then
+        warp_choice=$(parse_yes_no "$XRAY_WARP") || fail "环境变量 XRAY_WARP=${XRAY_WARP} 不合法，需为 y 或 n"
+        info "WARP 分流: $(on_off "$warp_choice") (来自环境变量 XRAY_WARP)"
+        return
+    fi
+    if ! has_tty; then
+        warp_choice=$default_warp
+        info "WARP 分流: $(on_off "$warp_choice") (无交互终端且未设置 XRAY_WARP，取默认值)"
+        return
+    fi
+    warp_choice=$(read_yes_no "是否开启 Cloudflare WARP 分流 (AI 服务、Netflix、Disney+ 经 WARP 出站)" "$default_warp")
+    info "WARP 分流: $(on_off "$warp_choice")"
 }
 
 check_sni_tls13() {
@@ -244,14 +397,31 @@ detect_server_ip() {
     info "注意: 公网 IP 查询全部失败，改用本机出口网卡地址 ${server_ip}；若这是内网地址，请在客户端里手动换成服务器公网 IP"
 }
 
+check_sni_not_self() {
+    local resolved local_addrs addr
+    if ! command -v getent >/dev/null 2>&1; then
+        info "未找到 getent 命令，跳过伪装站是否指向本机的检查"
+        return
+    fi
+    resolved=$(getent ahosts "$sni" 2>/dev/null | awk '{print $1}' | sort -u || true)
+    if [ -z "$resolved" ]; then
+        info "伪装站 ${sni} 暂时解析不到 IP，跳过是否指向本机的检查"
+        return
+    fi
+    local_addrs=$(ip -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}' || true)
+    for addr in $resolved; do
+        if [[ $addr == 127.* || $addr == ::1 || $addr == 0.0.0.0 || $addr == "$server_ip" ]] || grep -qxF "$addr" <<<"$local_addrs"; then
+            fail "伪装目标 ${sni} 解析到本机地址 ${addr}，REALITY 会把连接转发给自己，形成无限自连并耗尽连接数和内存；请换成第三方网站 (如 ${DEFAULT_SNI})"
+        fi
+    done
+    info "伪装站 ${sni} 解析到 $(tr '\n' ' ' <<<"$resolved")未指向本机"
+}
+
 ensure_docker() {
     if command -v docker >/dev/null 2>&1; then
         info "Docker 已安装 ($(docker --version 2>/dev/null || echo 版本未知))，跳过安装"
     else
-        step "未检测到 Docker，正在通过 get.docker.com 安装..."
-        tmp_get_docker=$(mktemp)
-        curl -fsSL https://get.docker.com -o "$tmp_get_docker" || fail "下载 get.docker.com 安装脚本失败"
-        sh "$tmp_get_docker" </dev/null || fail "Docker 安装失败，请查看上方 get.docker.com 的输出"
+        install_docker
         if command -v systemctl >/dev/null 2>&1; then
             systemctl enable --now docker || fail "systemctl enable --now docker 失败"
         fi
@@ -269,6 +439,29 @@ ensure_docker() {
     if command -v systemctl >/dev/null 2>&1 && [ "$(systemctl is-enabled docker 2>/dev/null || true)" = disabled ]; then
         info "注意: Docker 未设置开机自启，服务器重启后 Xray 不会自动恢复，可执行 systemctl enable docker"
     fi
+}
+
+install_docker() {
+    local os_id package_manager
+    step "未检测到 Docker，正在通过 get.docker.com 安装..."
+    tmp_get_docker=$(mktemp)
+    curl -fsSL https://get.docker.com -o "$tmp_get_docker" || fail "下载 get.docker.com 安装脚本失败"
+    if sh "$tmp_get_docker" </dev/null; then
+        return
+    fi
+    os_id=$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' /etc/os-release 2>/dev/null || true)
+    case $os_id in
+        rocky | almalinux | ol | centos | rhel) ;;
+        *) fail "Docker 安装失败 (系统 ID: ${os_id:-未知})，请查看上方 get.docker.com 的输出" ;;
+    esac
+    package_manager=dnf
+    if ! command -v dnf >/dev/null 2>&1; then
+        package_manager=yum
+    fi
+    info "get.docker.com 安装失败，系统 ${os_id} 属于 RHEL 系，改用 Docker 官方 centos 源通过 ${package_manager} 安装"
+    curl -fsSL https://download.docker.com/linux/centos/docker-ce.repo -o /etc/yum.repos.d/docker-ce.repo || fail "下载 Docker 官方 centos 源失败"
+    "$package_manager" install -y docker-ce docker-ce-cli containerd.io </dev/null || fail "通过 Docker 官方 centos 源安装失败 (${package_manager} install docker-ce docker-ce-cli containerd.io)"
+    info "已通过 Docker 官方 centos 源安装 ($(docker --version 2>/dev/null || echo 版本未知))"
 }
 
 ensure_image() {
@@ -311,6 +504,220 @@ prepare_credentials() {
     info "Short ID: ${short_id}"
 }
 
+register_warp() {
+    local output wg_private wg_public tos body response http_code curl_code=0 addresses client_id
+    if ! output=$(docker run --rm "$XRAY_IMAGE" xray wg 2>&1); then
+        warp_failure="执行 xray wg 生成 WireGuard 密钥失败"
+        return 1
+    fi
+    wg_private=$(key_from_output private "$output")
+    wg_public=$(key_from_output public "$output")
+    if ! valid_wg_key "$wg_private" || ! valid_wg_key "$wg_public"; then
+        warp_failure="无法解析 xray wg 的输出 (输出字段: $(output_labels "$output"))"
+        return 1
+    fi
+    tos=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+    body="{\"fcm_token\":\"\",\"install_id\":\"\",\"key\":\"${wg_public}\",\"locale\":\"en_US\",\"model\":\"PC\",\"tos\":\"${tos}\",\"serial_number\":\"\",\"os_version\":\"16.0.0\",\"key_type\":\"curve25519\",\"tunnel_type\":\"wireguard\"}"
+    response=$(curl -sS --max-time 20 -X POST "$WARP_API" \
+        -H "User-Agent: ${WARP_USER_AGENT}" \
+        -H "CF-Client-Version: ${WARP_CLIENT_VERSION}" \
+        -H "Content-Type: application/json; charset=UTF-8" \
+        -d "$body" -w $'\n%{http_code}' 2>/dev/null) || curl_code=$?
+    if [ "$curl_code" -ne 0 ]; then
+        warp_failure="调用 WARP 注册接口失败 (curl 退出码 ${curl_code})"
+        return 1
+    fi
+    http_code=${response##*$'\n'}
+    response=$(tr -d ' \t\r\n' <<<"${response%$'\n'*}")
+    if [ "$http_code" != 200 ]; then
+        warp_failure="WARP 注册接口返回 HTTP ${http_code} (响应: ${response:0:160})"
+        return 1
+    fi
+    addresses=$(first_match '"addresses":\{[^}]*\}' "$response")
+    warp_v4=$(json_string "$addresses" '"v4":"[^"]*"')
+    warp_v6=$(json_string "$addresses" '"v6":"[^"]*"')
+    client_id=$(json_string "$response" '"client_id":"[^"]*"')
+    warp_reserved=$(decode_reserved "$client_id")
+    warp_peer=$(json_string "$response" '"public_key":"[^"]*"')
+    warp_endpoint=$(json_string "$response" '"host":"[^"]*"')
+    warp_secret=$wg_private
+    if ! valid_ipv4 "$warp_v4" || ! valid_ipv6 "$warp_v6" || ! valid_reserved "$warp_reserved" || ! valid_wg_key "$warp_peer" || ! valid_endpoint "$warp_endpoint"; then
+        warp_failure="无法解析 WARP 注册结果 (IPv4: ${warp_v4:-空}, IPv6: ${warp_v6:-空}, client_id: ${client_id:-空} -> reserved: ${warp_reserved:-空}, 对端公钥: ${warp_peer:-空}, endpoint: ${warp_endpoint:-空})"
+        return 1
+    fi
+    info "WARP 注册成功 (地址: ${warp_v4}, ${warp_v6}, reserved: ${warp_reserved}, endpoint: ${warp_endpoint})"
+}
+
+render_warp_outbound() {
+    local endpoint_strategy=ForceIPv4
+    if [[ $server_ip == *:* ]]; then
+        endpoint_strategy=ForceIPv6
+    fi
+    cat <<EOF
+    {
+      "tag": "warp",
+      "protocol": "wireguard",
+      "targetStrategy": "${WARP_TARGET_STRATEGY}",
+      "streamSettings": {
+        "sockopt": {
+          "domainStrategy": "${endpoint_strategy}"
+        }
+      },
+      "settings": {
+        "secretKey": "${warp_secret}",
+        "address": [
+          "${warp_v4}/32",
+          "${warp_v6}/128"
+        ],
+        "peers": [
+          {
+            "publicKey": "${warp_peer}",
+            "allowedIPs": [
+              "0.0.0.0/0",
+              "::/0"
+            ],
+            "endpoint": "${warp_endpoint}"
+          }
+        ],
+        "reserved": [${warp_reserved//,/, }],
+        "mtu": ${WARP_MTU},
+        "noKernelTun": true
+      }
+    }
+EOF
+}
+
+render_warp_domains() {
+    local domain sep=""
+    for domain in "${WARP_DOMAINS[@]}"; do
+        printf '%s          "%s"' "$sep" "$domain"
+        sep=$',\n'
+    done
+}
+
+render_warp_routing() {
+    cat <<EOF
+,
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "domain": [
+$(render_warp_domains)
+        ],
+        "outboundTag": "warp"
+      }
+    ]
+  }
+EOF
+}
+
+render_warp_check_config() {
+    cat <<EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": $1,
+      "protocol": "socks",
+      "settings": {
+        "udp": false
+      }
+    }
+  ],
+  "outbounds": [
+$(render_warp_outbound)
+  ]
+}
+EOF
+}
+
+pick_free_port() {
+    local p
+    for ((p = 20808; p <= 20908; p++)); do
+        if [ -z "$(ss -Htln "sport = :${p}" 2>/dev/null || true)" ]; then
+            printf '%s' "$p"
+            return
+        fi
+    done
+    return 1
+}
+
+check_warp() {
+    local check_port attempt trace warp_flag="" egress=""
+    if ! check_port=$(pick_free_port); then
+        warp_failure="找不到空闲的本地端口 (20808-20908) 用于 WARP 连通性检测"
+        return 1
+    fi
+    warp_check_dir=$(mktemp -d)
+    (umask 077 && render_warp_check_config "$check_port" >"${warp_check_dir}/config.json")
+    docker rm -f -v "$WARP_CHECK_CONTAINER" >/dev/null 2>&1 || true
+    if ! docker run -d --name "$WARP_CHECK_CONTAINER" --net host -v "${warp_check_dir}:/etc/xray:ro" "$XRAY_IMAGE" >/dev/null; then
+        warp_failure="启动 WARP 检测容器 ${WARP_CHECK_CONTAINER} 失败"
+        return 1
+    fi
+    warp_check_started=true
+    for ((attempt = 1; attempt <= 3; attempt++)); do
+        sleep 2
+        trace=$(curl -s --max-time 10 -x "socks5h://127.0.0.1:${check_port}" "$WARP_CHECK_URL" 2>/dev/null || true)
+        warp_flag=$(awk -F= '$1 == "warp" {print $2}' <<<"$trace")
+        egress=$(awk -F= '$1 == "ip" {print $2}' <<<"$trace")
+        if [ "$warp_flag" = on ] || [ "$warp_flag" = plus ]; then
+            info "WARP 连通性检测通过 (第 ${attempt} 次, WARP 出口 IP: ${egress}, warp=${warp_flag})"
+            break
+        fi
+        info "WARP 连通性检测第 ${attempt} 次未通过 (warp=${warp_flag:-无响应}, 出口 IP: ${egress:-无})"
+    done
+    if [ "$warp_flag" != on ] && [ "$warp_flag" != plus ]; then
+        docker logs --tail 3 "$WARP_CHECK_CONTAINER" >&2 || true
+    fi
+    docker rm -f -v "$WARP_CHECK_CONTAINER" >/dev/null 2>&1 || true
+    warp_check_started=false
+    rm -rf "$warp_check_dir"
+    warp_check_dir=""
+    if [ "$warp_flag" = on ] || [ "$warp_flag" = plus ]; then
+        return 0
+    fi
+    warp_failure="WARP 连通性检测 3 次均未通过 (经 WARP 访问 ${WARP_CHECK_URL} 未得到 warp=on，上面是检测容器日志)"
+    return 1
+}
+
+skip_warp() {
+    warp_enabled=false
+    warp_status="未开启 (开启失败已跳过: ${warp_failure})"
+    info "注意: ${warp_failure}，本次跳过 WARP，Reality 照常安装"
+}
+
+setup_warp() {
+    if [ "$warp_choice" != y ]; then
+        warp_status="未开启"
+        if [ "$default_warp" = y ]; then
+            info "跳过 WARP: 本次选择不开启，已安装的 WARP 出站将从配置中移除"
+        else
+            info "跳过 WARP: 未选择开启"
+        fi
+        return
+    fi
+    if [ "$reuse_warp" = true ]; then
+        info "复用已有 WARP 账号 (地址: ${warp_v4}, ${warp_v6})，不重新注册"
+    else
+        step "正在注册 Cloudflare WARP 账号..."
+        if ! register_warp; then
+            skip_warp
+            return
+        fi
+    fi
+    if ! check_warp; then
+        skip_warp
+        return
+    fi
+    warp_enabled=true
+    warp_status="已开启 (AI 服务 / Netflix / Disney+ 经 WARP 出站，IPv4 优先)"
+}
+
 check_port_free() {
     if ! command -v ss >/dev/null 2>&1; then
         info "未找到 ss 命令，跳过端口 ${port} 占用检查"
@@ -332,6 +739,11 @@ check_port_free() {
 }
 
 render_config() {
+    local warp_outbound="" warp_routing=""
+    if [ "$warp_enabled" = true ]; then
+        warp_outbound=$',\n'"$(render_warp_outbound)"
+        warp_routing=$(render_warp_routing)
+    fi
     cat <<EOF
 {
   "log": {
@@ -380,8 +792,8 @@ render_config() {
     {
       "protocol": "freedom",
       "settings": {}
-    }
-  ]
+    }${warp_outbound}
+  ]${warp_routing}
 }
 EOF
 }
@@ -400,7 +812,7 @@ write_and_test_config() {
 
 start_container() {
     if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
-        docker rm -f "$CONTAINER_NAME" >/dev/null
+        docker rm -f -v "$CONTAINER_NAME" >/dev/null
         info "已移除旧容器 ${CONTAINER_NAME}"
     fi
     mv -f "$tmp_config" "$CONFIG_FILE"
@@ -410,8 +822,12 @@ start_container() {
         --name "$CONTAINER_NAME" \
         --restart always \
         --net host \
+        --log-driver json-file \
+        --log-opt max-size="$LOG_MAX_SIZE" \
+        --log-opt max-file="$LOG_MAX_FILE" \
         -v "${CONFIG_DIR}:${CONFIG_DIR}" \
         "$XRAY_IMAGE" >/dev/null || fail "启动容器 ${CONTAINER_NAME} 失败"
+    info "容器日志按 json-file 轮转，单文件上限 ${LOG_MAX_SIZE}，最多保留 ${LOG_MAX_FILE} 份"
 }
 
 wait_for_xray() {
@@ -450,6 +866,7 @@ open_firewall() {
             else
                 info "注意: ufw 放行 TCP ${port} 失败，请手动执行 ufw allow ${port}/tcp"
             fi
+            remind_old_port_rule ufw "$status"
             return
         fi
     fi
@@ -459,9 +876,72 @@ open_firewall() {
         else
             info "注意: firewalld 放行 TCP ${port} 失败，请手动执行 firewall-cmd --permanent --add-port=${port}/tcp && firewall-cmd --reload"
         fi
+        remind_old_port_rule firewalld ""
         return
     fi
     info "未检测到启用中的 ufw / firewalld，跳过系统防火墙放行；如云厂商有安全组，请自行放行 TCP ${port}"
+}
+
+remind_old_port_rule() {
+    if ! valid_port "$installed_port" || [ "$installed_port" = "$port" ]; then
+        return
+    fi
+    if [ "$1" = ufw ]; then
+        if grep -qE "^${installed_port}/tcp[[:space:]]" <<<"$2"; then
+            info "提示: 端口已从 ${installed_port} 改为 ${port}，旧端口的 ufw 放行规则保留未删；确认不再需要可执行: ufw delete allow ${installed_port}/tcp"
+        fi
+        return
+    fi
+    if firewall-cmd --permanent --query-port="${installed_port}/tcp" >/dev/null 2>&1; then
+        info "提示: 端口已从 ${installed_port} 改为 ${port}，旧端口的 firewalld 放行规则保留未删；确认不再需要可执行: firewall-cmd --permanent --remove-port=${installed_port}/tcp && firewall-cmd --reload"
+    fi
+}
+
+enable_bbr() {
+    local kernel available old_cc old_qdisc new_cc new_qdisc lines persist_note
+    kernel=$(uname -r)
+    if ! command -v sysctl >/dev/null 2>&1; then
+        bbr_status="未开启 (缺少 sysctl 命令)"
+        info "提示: 未找到 sysctl 命令，跳过 BBR"
+        return
+    fi
+    old_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)
+    old_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)
+    if [ "$bbr_choice" != y ]; then
+        bbr_status="按选择跳过，未改动 (当前拥塞控制 ${old_cc}, 队列算法 ${old_qdisc})"
+        info "跳过 BBR: 你选择不开启，保持现状 (拥塞控制: ${old_cc}, 队列算法: ${old_qdisc})"
+        return
+    fi
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    if [[ " ${available} " != *" bbr "* ]] && command -v modprobe >/dev/null 2>&1 && modprobe tcp_bbr 2>/dev/null; then
+        available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+        info "已加载内核模块 tcp_bbr (可用算法: ${available})"
+    fi
+    if [[ " ${available} " != *" bbr "* ]]; then
+        bbr_status="未开启 (内核 ${kernel} 不支持)"
+        info "提示: 内核 ${kernel} 不支持 BBR (可用算法: ${available:-无法读取})，跳过 BBR，不升级内核"
+        return
+    fi
+    if ! sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1; then
+        bbr_status="未开启 (无法修改内核参数)"
+        info "提示: 无法设置 net.ipv4.tcp_congestion_control=bbr (多见于 OpenVZ/LXC 等容器 VPS，内核参数由宿主机控制)，跳过 BBR"
+        return
+    fi
+    mkdir -p "$(dirname "$BBR_SYSCTL_FILE")" 2>/dev/null || true
+    if sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1; then
+        lines=$'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr'
+    else
+        info "提示: 无法设置 net.core.default_qdisc=fq，队列算法保持 ${old_qdisc}；4.13 及以上内核的 BBR 不依赖 fq"
+        lines="net.ipv4.tcp_congestion_control = bbr"
+    fi
+    persist_note="已写入 ${BBR_SYSCTL_FILE}，重启后保持"
+    if ! printf '%s\n' "$lines" >"$BBR_SYSCTL_FILE"; then
+        persist_note="注意: 写入 ${BBR_SYSCTL_FILE} 失败，本次已生效但重启后不会保持"
+    fi
+    new_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 未知)
+    new_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo 未知)
+    bbr_status="已开启 (拥塞控制 ${new_cc}, 队列算法 ${new_qdisc})"
+    info "BBR 已开启 (拥塞控制: ${old_cc} -> ${new_cc}, 队列算法: ${old_qdisc} -> ${new_qdisc})，${persist_note}"
 }
 
 render_client_info() {
@@ -479,6 +959,9 @@ SNI:         ${hl}${sni}${off}
 Fingerprint: ${hl}${FINGERPRINT}${off}
 PublicKey:   ${hl}${public_key}${off}
 ShortId:     ${hl}${short_id}${off}
+========================================
+BBR 加速:    ${hl}${bbr_status}${off}
+WARP 分流:   ${hl}${warp_status}${off}
 ========================================
 
 分享链接:
@@ -511,16 +994,21 @@ main() {
     load_existing_config
     choose_sni
     choose_port
+    choose_bbr
+    choose_warp
     check_sni_tls13
     detect_server_ip
+    check_sni_not_self
     ensure_docker
     ensure_image
     prepare_credentials
+    setup_warp
     check_port_free
     write_and_test_config
     start_container
     wait_for_xray
     open_firewall
+    enable_bbr
     show_result
 }
 
