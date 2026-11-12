@@ -1,8 +1,0 @@
-domain.me {
-  encode gzip
-  root /* /root/xray_web
-  file_server
-  reverse_proxy /fire 127.0.0.1:10110 {
-    header_up -Origin
-  }
-}
