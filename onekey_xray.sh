@@ -6,10 +6,16 @@ readonly CONTAINER_NAME="xray-reality"
 readonly CONFIG_DIR="/etc/xray"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
 readonly INFO_FILE="${CONFIG_DIR}/client-info.txt"
-readonly DEFAULT_SNI="www.microsoft.com"
+readonly CLASH_FILE="${CONFIG_DIR}/clash.yaml"
+readonly -a SNI_POOL=('www.samsung.com' 'www.amd.com' 'www.tesla.com' 'www.cisco.com' 'www.autodesk.com')
 readonly DEFAULT_PORT="443"
 readonly FLOW="xtls-rprx-vision"
 readonly FINGERPRINT="chrome"
+readonly FALLBACK_AFTER_BYTES_CENTER=10485760
+readonly FALLBACK_BYTES_PER_SEC_CENTER=1048576
+readonly FALLBACK_BURST_BYTES_PER_SEC_CENTER=5242880
+readonly FALLBACK_JITTER_PERCENT=30
+readonly SNI_PROBE_TIMEOUT=10
 readonly HEALTH_WAIT_SECONDS=10
 readonly BBR_SYSCTL_FILE="/etc/sysctl.d/99-xray-bbr.conf"
 readonly LOG_MAX_SIZE="10m"
@@ -30,7 +36,7 @@ readonly NC=$'\033[0m'
 
 sni=""
 port=""
-default_sni=$DEFAULT_SNI
+default_sni=""
 default_port=$DEFAULT_PORT
 reuse_credentials=false
 old_uuid=""
@@ -61,6 +67,17 @@ warp_peer=""
 warp_endpoint=""
 warp_check_dir=""
 warp_check_started=false
+fallback_choice=""
+default_fallback="n"
+reuse_fallback=false
+fallback_enabled=false
+fallback_status=""
+fallback_up_after=""
+fallback_up_rate=""
+fallback_up_burst=""
+fallback_down_after=""
+fallback_down_rate=""
+fallback_down_burst=""
 
 step() { printf '%s\n' "${GREEN}$*${NC}"; }
 info() { printf '%s\n' "${YELLOW}$*${NC}"; }
@@ -164,6 +181,41 @@ first_match() {
     { grep -oE "$1" <<<"$2" || true; } | head -n 1
 }
 
+config_port() {
+    { grep -oE '"port":[0-9]+' <<<"$1" || true; } | awk -F: 'NR == 1 {print $2}'
+}
+
+json_number() {
+    { grep -oE "\"$2\":[0-9]+" <<<"$1" || true; } | awk -F: 'NR == 1 {print $2}'
+}
+
+jitter_value() {
+    local center=$1 lo hi
+    lo=$((center * (100 - FALLBACK_JITTER_PERCENT) / 100))
+    hi=$((center * (100 + FALLBACK_JITTER_PERCENT) / 100))
+    printf '%s' "$((lo + RANDOM % (hi - lo + 1)))"
+}
+
+shuffled_sni_pool() {
+    local -a pool=("${SNI_POOL[@]}")
+    local i j tmp
+    for ((i = ${#pool[@]} - 1; i > 0; i--)); do
+        j=$((RANDOM % (i + 1)))
+        tmp=${pool[i]}
+        pool[i]=${pool[j]}
+        pool[j]=$tmp
+    done
+    printf '%s\n' "${pool[@]}"
+}
+
+image_id() {
+    docker image inspect -f '{{.Id}}' "$XRAY_IMAGE" 2>/dev/null || true
+}
+
+image_xray_version() {
+    docker run --rm "$XRAY_IMAGE" xray version 2>/dev/null | awk 'NR == 1 {print $2}' || true
+}
+
 decode_reserved() {
     { printf '%s' "$1" | base64 -d 2>/dev/null || true; } | od -An -tu1 | awk '{for (i = 1; i <= NF; i++) printf "%s%s", (n++ ? "," : ""), $i}'
 }
@@ -203,7 +255,7 @@ load_existing_config() {
     local flat old_sni old_port
     flat=$(tr -d ' \t\r\n' <"$CONFIG_FILE")
     old_sni=$(json_string "$flat" '"serverNames":\["[^"]*"')
-    old_port=$({ grep -oE '"port":[0-9]+' <<<"$flat" || true; } | awk -F: 'NR == 1 {print $2}')
+    old_port=$(config_port "$flat")
     old_uuid=$(json_string "$flat" '"id":"[^"]*"')
     old_private_key=$(json_string "$flat" '"privateKey":"[^"]*"')
     old_short_id=$(json_string "$flat" '"shortIds":\["[^"]*"')
@@ -213,7 +265,7 @@ load_existing_config() {
         default_sni=$old_sni
         info "沿用已安装的 SNI 作为默认值: ${default_sni}"
     else
-        info "已有配置中的 SNI 不合法 (值: ${old_sni:-空})，默认值仍为 ${DEFAULT_SNI}"
+        info "已有配置中的 SNI 不合法 (值: ${old_sni:-空})，将从候选池重新挑选默认值"
     fi
 
     if valid_port "$old_port"; then
@@ -225,6 +277,7 @@ load_existing_config() {
     fi
 
     load_existing_warp "$flat"
+    load_existing_fallback "$flat"
 
     if valid_uuid "$old_uuid" && valid_key "$old_private_key" && valid_short_id "$old_short_id"; then
         reuse_credentials=true
@@ -264,12 +317,61 @@ load_existing_warp() {
     warp_endpoint=""
 }
 
+load_existing_fallback() {
+    local flat=$1 up down
+    up=$(first_match '"limitFallbackUpload":\{[^}]*\}' "$flat")
+    down=$(first_match '"limitFallbackDownload":\{[^}]*\}' "$flat")
+    fallback_up_after=$(json_number "$up" afterBytes)
+    fallback_up_rate=$(json_number "$up" bytesPerSec)
+    fallback_up_burst=$(json_number "$up" burstBytesPerSec)
+    fallback_down_after=$(json_number "$down" afterBytes)
+    fallback_down_rate=$(json_number "$down" bytesPerSec)
+    fallback_down_burst=$(json_number "$down" burstBytesPerSec)
+    if [ "${fallback_up_rate:-0}" -eq 0 ] && [ "${fallback_down_rate:-0}" -eq 0 ]; then
+        info "已有配置未开启回落限速，回落限速默认值为不开启"
+        return
+    fi
+    default_fallback=y
+    if [ -n "$fallback_up_after" ] && [ -n "$fallback_up_burst" ] && [ -n "$fallback_down_after" ] && [ -n "$fallback_down_burst" ] && [ "${fallback_up_rate:-0}" -gt 0 ] && [ "${fallback_down_rate:-0}" -gt 0 ]; then
+        reuse_fallback=true
+        info "已有配置开启了回落限速 (上行 ${fallback_up_after}/${fallback_up_rate}/${fallback_up_burst}, 下行 ${fallback_down_after}/${fallback_down_rate}/${fallback_down_burst})，默认值沿用为开启，开启时复用这些值"
+        return
+    fi
+    info "注意: 已有配置的回落限速参数不完整 (上行: ${fallback_up_after:-空}/${fallback_up_rate:-空}/${fallback_up_burst:-空}, 下行: ${fallback_down_after:-空}/${fallback_down_rate:-空}/${fallback_down_burst:-空})，默认值沿用为开启，开启时重新随机生成"
+    fallback_up_after=""
+    fallback_up_rate=""
+    fallback_up_burst=""
+    fallback_down_after=""
+    fallback_down_rate=""
+    fallback_down_burst=""
+}
+
+pick_default_sni() {
+    local candidate code
+    step "正在从候选池挑选伪装目标 (共 ${#SNI_POOL[@]} 个，随机顺序逐个检测 TLS 1.3)..."
+    while read -r candidate; do
+        code=0
+        curl -s -o /dev/null --max-time "$SNI_PROBE_TIMEOUT" --tlsv1.3 "https://${candidate}" || code=$?
+        if [ "$code" -eq 0 ]; then
+            default_sni=$candidate
+            info "候选 ${candidate} 支持 TLS 1.3，选为默认伪装目标"
+            return
+        fi
+        info "候选 ${candidate} 检测未通过 (curl 退出码 ${code})，尝试下一个"
+    done < <(shuffled_sni_pool)
+    default_sni=$(shuffled_sni_pool | head -n 1)
+    info "注意: 候选池 ${#SNI_POOL[@]} 个域名全部检测未通过，仍取 ${default_sni} 作为默认值；REALITY 要求伪装站能从本机访问且支持 TLS 1.3，建议用 XRAY_SNI 指定一个可用域名"
+}
+
 choose_sni() {
     if [ -n "${XRAY_SNI:-}" ]; then
-        valid_domain "$XRAY_SNI" || fail "环境变量 XRAY_SNI=${XRAY_SNI} 不是合法域名 (示例: www.microsoft.com)"
+        valid_domain "$XRAY_SNI" || fail "环境变量 XRAY_SNI=${XRAY_SNI} 不是合法域名 (示例: ${SNI_POOL[0]})"
         sni=$XRAY_SNI
         info "伪装目标 (dest/SNI): ${sni} (来自环境变量 XRAY_SNI)"
         return
+    fi
+    if [ -z "$default_sni" ]; then
+        pick_default_sni
     fi
     if ! has_tty; then
         sni=$default_sni
@@ -352,6 +454,21 @@ choose_warp() {
     info "WARP 分流: $(on_off "$warp_choice")"
 }
 
+choose_fallback() {
+    if [ -n "${XRAY_FALLBACK_LIMIT:-}" ]; then
+        fallback_choice=$(parse_yes_no "$XRAY_FALLBACK_LIMIT") || fail "环境变量 XRAY_FALLBACK_LIMIT=${XRAY_FALLBACK_LIMIT} 不合法，需为 y 或 n"
+        info "回落限速: $(on_off "$fallback_choice") (来自环境变量 XRAY_FALLBACK_LIMIT)"
+        return
+    fi
+    if ! has_tty; then
+        fallback_choice=$default_fallback
+        info "回落限速: $(on_off "$fallback_choice") (无交互终端且未设置 XRAY_FALLBACK_LIMIT，取默认值)"
+        return
+    fi
+    fallback_choice=$(read_yes_no "是否开启 REALITY 回落限速 (限制认证失败的偷跑流量，本身也是一种特征，伪装站与本机同 ASN 时无需开启)" "$default_fallback")
+    info "回落限速: $(on_off "$fallback_choice")"
+}
+
 check_sni_tls13() {
     local code=0 reason
     curl -s -o /dev/null --max-time 10 --tlsv1.3 "https://${sni}" || code=$?
@@ -411,7 +528,7 @@ check_sni_not_self() {
     local_addrs=$(ip -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}' || true)
     for addr in $resolved; do
         if [[ $addr == 127.* || $addr == ::1 || $addr == 0.0.0.0 || $addr == "$server_ip" ]] || grep -qxF "$addr" <<<"$local_addrs"; then
-            fail "伪装目标 ${sni} 解析到本机地址 ${addr}，REALITY 会把连接转发给自己，形成无限自连并耗尽连接数和内存；请换成第三方网站 (如 ${DEFAULT_SNI})"
+            fail "伪装目标 ${sni} 解析到本机地址 ${addr}，REALITY 会把连接转发给自己，形成无限自连并耗尽连接数和内存；请换成第三方网站 (如 ${SNI_POOL[0]})"
         fi
     done
     info "伪装站 ${sni} 解析到 $(tr '\n' ' ' <<<"$resolved")未指向本机"
@@ -471,7 +588,7 @@ ensure_image() {
         step "正在拉取镜像 ${XRAY_IMAGE}..."
         docker pull "$XRAY_IMAGE" || fail "拉取镜像 ${XRAY_IMAGE} 失败"
     fi
-    info "Xray 版本: $(docker run --rm "$XRAY_IMAGE" xray version 2>/dev/null | awk 'NR == 1 {print $2}' || true)"
+    info "Xray 版本: $(image_xray_version)"
 }
 
 prepare_credentials() {
@@ -718,6 +835,31 @@ setup_warp() {
     warp_status="已开启 (AI 服务 / Netflix / Disney+ 经 WARP 出站，IPv4 优先)"
 }
 
+setup_fallback() {
+    if [ "$fallback_choice" != y ]; then
+        fallback_status="未开启"
+        if [ "$default_fallback" = y ]; then
+            info "跳过回落限速: 本次选择不开启，已安装的回落限速参数将从配置中移除"
+        else
+            info "跳过回落限速: 未选择开启 (伪装站与本机同 ASN 时本就不需要)"
+        fi
+        return
+    fi
+    if [ "$reuse_fallback" = true ]; then
+        info "复用已有回落限速参数 (上行 ${fallback_up_after}/${fallback_up_rate}/${fallback_up_burst}, 下行 ${fallback_down_after}/${fallback_down_rate}/${fallback_down_burst})，不重新随机"
+    else
+        fallback_up_after=$(jitter_value "$FALLBACK_AFTER_BYTES_CENTER")
+        fallback_up_rate=$(jitter_value "$FALLBACK_BYTES_PER_SEC_CENTER")
+        fallback_up_burst=$(jitter_value "$FALLBACK_BURST_BYTES_PER_SEC_CENTER")
+        fallback_down_after=$(jitter_value "$FALLBACK_AFTER_BYTES_CENTER")
+        fallback_down_rate=$(jitter_value "$FALLBACK_BYTES_PER_SEC_CENTER")
+        fallback_down_burst=$(jitter_value "$FALLBACK_BURST_BYTES_PER_SEC_CENTER")
+        info "回落限速参数已随机生成 (以官方示例值为中心 ±${FALLBACK_JITTER_PERCENT}%，上行 ${fallback_up_after}/${fallback_up_rate}/${fallback_up_burst}, 下行 ${fallback_down_after}/${fallback_down_rate}/${fallback_down_burst})"
+    fi
+    fallback_enabled=true
+    fallback_status="已开启 (上行 ${fallback_up_after}/${fallback_up_rate}/${fallback_up_burst}, 下行 ${fallback_down_after}/${fallback_down_rate}/${fallback_down_burst}，仅限制认证失败的连接)"
+}
+
 check_port_free() {
     if ! command -v ss >/dev/null 2>&1; then
         info "未找到 ss 命令，跳过端口 ${port} 占用检查"
@@ -738,11 +880,30 @@ check_port_free() {
     fail "端口 ${port} 已被占用 (pid/进程: $(tr '\n' ';' <<<"${owners:-$listeners}"))，需空闲或仅被 ${CONTAINER_NAME} 占用；请换端口 (XRAY_PORT) 或先停掉占用进程"
 }
 
+render_fallback_limits() {
+    cat <<EOF
+,
+          "limitFallbackUpload": {
+            "afterBytes": ${fallback_up_after},
+            "bytesPerSec": ${fallback_up_rate},
+            "burstBytesPerSec": ${fallback_up_burst}
+          },
+          "limitFallbackDownload": {
+            "afterBytes": ${fallback_down_after},
+            "bytesPerSec": ${fallback_down_rate},
+            "burstBytesPerSec": ${fallback_down_burst}
+          }
+EOF
+}
+
 render_config() {
-    local warp_outbound="" warp_routing=""
+    local warp_outbound="" warp_routing="" fallback_limits=""
     if [ "$warp_enabled" = true ]; then
         warp_outbound=$',\n'"$(render_warp_outbound)"
         warp_routing=$(render_warp_routing)
+    fi
+    if [ "$fallback_enabled" = true ]; then
+        fallback_limits=$(render_fallback_limits)
     fi
     cat <<EOF
 {
@@ -775,7 +936,7 @@ render_config() {
           "privateKey": "${private_key}",
           "shortIds": [
             "${short_id}"
-          ]
+          ]${fallback_limits}
         }
       },
       "sniffing": {
@@ -808,16 +969,19 @@ write_and_test_config() {
         fail "新配置未通过 xray run -test 校验，原配置 ${CONFIG_FILE} 保持不变"
     fi
     info "新配置已通过 xray run -test 校验"
+    if [ "$fallback_enabled" = true ]; then
+        info "回落限速已写入配置 (仅限制认证失败的连接，已通过认证的客户端不受影响)"
+    fi
 }
 
-start_container() {
+remove_old_container() {
     if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
         docker rm -f -v "$CONTAINER_NAME" >/dev/null
         info "已移除旧容器 ${CONTAINER_NAME}"
     fi
-    mv -f "$tmp_config" "$CONFIG_FILE"
-    tmp_config=""
-    step "正在启动 Xray Reality..."
+}
+
+run_container() {
     docker run -d \
         --name "$CONTAINER_NAME" \
         --restart always \
@@ -828,6 +992,14 @@ start_container() {
         -v "${CONFIG_DIR}:${CONFIG_DIR}" \
         "$XRAY_IMAGE" >/dev/null || fail "启动容器 ${CONTAINER_NAME} 失败"
     info "容器日志按 json-file 轮转，单文件上限 ${LOG_MAX_SIZE}，最多保留 ${LOG_MAX_FILE} 份"
+}
+
+start_container() {
+    remove_old_container
+    mv -f "$tmp_config" "$CONFIG_FILE"
+    tmp_config=""
+    step "正在启动 Xray Reality..."
+    run_container
 }
 
 wait_for_xray() {
@@ -944,6 +1116,26 @@ enable_bbr() {
     info "BBR 已开启 (拥塞控制: ${old_cc} -> ${new_cc}, 队列算法: ${old_qdisc} -> ${new_qdisc})，${persist_note}"
 }
 
+render_clash_config() {
+    cat <<EOF
+proxies:
+  - name: "Reality-${server_ip}"
+    type: vless
+    server: "${server_ip}"
+    port: ${port}
+    uuid: "${uuid}"
+    flow: ${FLOW}
+    network: tcp
+    tls: true
+    udp: true
+    client-fingerprint: ${FINGERPRINT}
+    servername: ${sni}
+    reality-opts:
+      public-key: "${public_key}"
+      short-id: "${short_id}"
+EOF
+}
+
 render_client_info() {
     local hl=$1 off=$2
     cat <<EOF
@@ -962,6 +1154,7 @@ ShortId:     ${hl}${short_id}${off}
 ========================================
 BBR 加速:    ${hl}${bbr_status}${off}
 WARP 分流:   ${hl}${warp_status}${off}
+回落限速:    ${hl}${fallback_status}${off}
 ========================================
 
 分享链接:
@@ -976,6 +1169,7 @@ show_result() {
     fi
     vless_link="vless://${uuid}@${host}:${port}?encryption=none&flow=${FLOW}&security=reality&sni=${sni}&fp=${FINGERPRINT}&pbk=${public_key}&sid=${short_id}&type=tcp#Reality-${server_ip}"
     (umask 077 && render_client_info "" "" >"$INFO_FILE")
+    (umask 077 && render_clash_config >"$CLASH_FILE")
     echo
     step "========================================"
     step "  安装完成！"
@@ -983,11 +1177,67 @@ show_result() {
     echo
     render_client_info "$YELLOW" "$NC"
     echo
-    step "以上信息已保存到 ${INFO_FILE}，随时可执行 cat ${INFO_FILE} 查看"
+    step "Clash / mihomo 节点片段 (合并到客户端配置的 proxies 段):"
+    render_clash_config
+    echo
+    step "以上信息已保存到 ${INFO_FILE}，Clash 片段已保存到 ${CLASH_FILE}"
+    step "随时可执行 cat ${INFO_FILE} 或 cat ${CLASH_FILE} 查看"
     step "请妥善保存以上信息！"
 }
 
-main() {
+validate_installed_config() {
+    local output
+    if ! output=$(docker run --rm -v "${CONFIG_DIR}:${CONFIG_DIR}" "$XRAY_IMAGE" xray run -test -c "$CONFIG_FILE" 2>&1); then
+        printf '%s\n' "$output" | tail -n 5 >&2
+        fail "现有配置 ${CONFIG_FILE} 未通过新镜像的 xray run -test 校验，容器 ${CONTAINER_NAME} 保持原样继续运行旧版本"
+    fi
+    info "现有配置已通过新镜像的 xray run -test 校验"
+}
+
+update_xray() {
+    banner
+    require_root
+    require_curl
+    if [ ! -f "$CONFIG_FILE" ]; then
+        fail "未找到已安装的配置 ${CONFIG_FILE}，update 只更新已安装的 Xray，请先执行安装命令"
+    fi
+    ensure_docker
+    if ! docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+        fail "未找到容器 ${CONTAINER_NAME}，update 只更新已安装的 Xray，请先执行安装命令"
+    fi
+    local flat old_id new_id old_version new_version
+    flat=$(tr -d ' \t\r\n' <"$CONFIG_FILE")
+    port=$(config_port "$flat")
+    if ! valid_port "$port"; then
+        fail "已有配置中的端口不合法 (值: ${port:-空})，无法校验启动状态，请重新执行安装命令"
+    fi
+    port=$((10#$port))
+    info "update 只更新镜像与容器，配置、UUID、密钥、SNI、端口 ${port}、WARP 与 BBR 设置均保持不变"
+    old_id=$(image_id)
+    old_version=$(image_xray_version)
+    step "正在拉取最新镜像 ${XRAY_IMAGE}..."
+    docker pull "$XRAY_IMAGE" || fail "拉取镜像 ${XRAY_IMAGE} 失败，容器与配置保持不变"
+    new_id=$(image_id)
+    new_version=$(image_xray_version)
+    if [ -n "$old_id" ] && [ "$old_id" = "$new_id" ]; then
+        info "镜像已是最新 (Xray ${new_version:-版本未知}, imageId: ${new_id})，跳过重建容器"
+        step "无需更新，客户端配置不受影响"
+        return
+    fi
+    info "镜像已更新 (Xray ${old_version:-版本未知} -> ${new_version:-版本未知})"
+    validate_installed_config
+    step "正在用新镜像重建容器 ${CONTAINER_NAME}..."
+    remove_old_container
+    run_container
+    wait_for_xray
+    echo
+    step "========================================"
+    step "  更新完成！Xray ${old_version:-版本未知} -> ${new_version:-版本未知}"
+    step "========================================"
+    step "客户端配置未变动，无需重新导入；可执行 cat ${INFO_FILE} 查看"
+}
+
+install_xray() {
     banner
     require_root
     require_curl
@@ -996,6 +1246,7 @@ main() {
     choose_port
     choose_bbr
     choose_warp
+    choose_fallback
     check_sni_tls13
     detect_server_ip
     check_sni_not_self
@@ -1003,6 +1254,7 @@ main() {
     ensure_image
     prepare_credentials
     setup_warp
+    setup_fallback
     check_port_free
     write_and_test_config
     start_container
@@ -1010,6 +1262,14 @@ main() {
     open_firewall
     enable_bbr
     show_result
+}
+
+main() {
+    case "${1:-}" in
+        "") install_xray ;;
+        update) update_xray ;;
+        *) fail "未知参数: $1，用法: bash onekey_xray.sh (安装/重装) 或 bash onekey_xray.sh update (只更新 Xray 镜像与容器)" ;;
+    esac
 }
 
 main "$@"
