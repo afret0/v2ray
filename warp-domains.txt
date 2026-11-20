@@ -4,6 +4,15 @@
 # 内置的 geosite:category-ai-!cn / geosite:netflix / geosite:disney 始终生效, 无需写在这里
 # 在 GitHub 网页上直接编辑本文件, 服务器每天自动拉取一次, 内容变化时校验通过后自动应用
 
-example.com
-full:exact.example.org
-# geosite:google
+bandwagonhost.com
+bwh81.net
+bwg.net
+bwg.wiki
+vmiss.com
+dmit.io
+dmit.sh
+hostdare.com
+racknerd.com
+cloudcone.com
+hostinger.com
+ionos.com
