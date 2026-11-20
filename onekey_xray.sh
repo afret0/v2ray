@@ -28,6 +28,16 @@ readonly WARP_TARGET_STRATEGY="ForceIPv4v6"
 readonly WARP_CHECK_CONTAINER="xray-warp-check"
 readonly WARP_CHECK_URL="https://www.cloudflare.com/cdn-cgi/trace"
 readonly -a WARP_DOMAINS=('geosite:category-ai-!cn' 'geosite:netflix' 'geosite:disney')
+readonly WARP_SYNC_FILE="${CONFIG_DIR}/warp-sync.sh"
+readonly WARP_LIST_FILE="${CONFIG_DIR}/warp-domains.txt"
+readonly WARP_SYNC_STATE_FILE="${CONFIG_DIR}/warp-sync-state"
+readonly WARP_SYNC_UNIT="xray-warp-sync"
+readonly WARP_SYNC_INTERVAL="daily"
+readonly WARP_SYNC_JITTER_SECONDS=1800
+readonly WARP_SYNC_CRON_MARK="# xray warp sync"
+readonly WARP_SYNC_MAX_LINES=1000
+readonly WARP_SYNC_FETCH_TIMEOUT=20
+readonly WARP_LIST_URL="https://raw.githubusercontent.com/afret0/v2ray/master/warp-domains.txt"
 
 readonly GREEN=$'\033[0;32m'
 readonly YELLOW=$'\033[1;33m'
@@ -50,6 +60,7 @@ server_ip=""
 vless_link=""
 tmp_config=""
 tmp_get_docker=""
+tmp_warp_sync_script=""
 installed_port=""
 bbr_choice=""
 bbr_status=""
@@ -67,6 +78,16 @@ warp_peer=""
 warp_endpoint=""
 warp_check_dir=""
 warp_check_started=false
+warp_list_url=""
+default_warp_list_url=$WARP_LIST_URL
+warp_list_reuse=false
+warp_custom_domains=""
+warp_custom_count=0
+warp_list_status=""
+warp_list_skipped=""
+warp_list_skipped_count=0
+warp_list_truncated=false
+warp_sync_status=""
 fallback_choice=""
 default_fallback="n"
 reuse_fallback=false
@@ -93,6 +114,7 @@ on_error() {
 cleanup() {
     if [ -n "$tmp_config" ]; then rm -f "$tmp_config"; fi
     if [ -n "$tmp_get_docker" ]; then rm -f "$tmp_get_docker"; fi
+    if [ -n "$tmp_warp_sync_script" ]; then rm -f "$tmp_warp_sync_script"; fi
     if [ "$warp_check_started" = true ]; then docker rm -f -v "$WARP_CHECK_CONTAINER" >/dev/null 2>&1 || true; fi
     if [ -n "$warp_check_dir" ]; then rm -rf "$warp_check_dir"; fi
 }
@@ -141,6 +163,26 @@ valid_reserved() {
 
 valid_endpoint() {
     [[ $1 =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]]
+}
+
+valid_url() {
+    local re='^https://[A-Za-z0-9.-]+(/.*)?$'
+    [[ $1 =~ $re ]] && [[ $1 != *[[:space:]]* && $1 != *'"'* && $1 != *\\* && $1 != *"'"* ]]
+}
+
+valid_warp_line() {
+    case $1 in
+        full:*) valid_domain "${1#full:}" ;;
+        geosite:*) [[ ${1#geosite:} =~ ^[A-Za-z0-9@!_-]+$ ]] ;;
+        keyword:*) [[ ${1#keyword:} =~ ^[A-Za-z0-9._-]+$ ]] ;;
+        regexp:*) [[ -n ${1#regexp:} && ${1#regexp:} != *[[:space:]]* ]] ;;
+        *) valid_domain "$1" ;;
+    esac
+}
+
+json_escape() {
+    local value=${1//\\/\\\\}
+    printf '%s' "${value//\"/\\\"}"
 }
 
 parse_yes_no() {
@@ -278,6 +320,7 @@ load_existing_config() {
 
     load_existing_warp "$flat"
     load_existing_fallback "$flat"
+    load_existing_warp_list
 
     if valid_uuid "$old_uuid" && valid_key "$old_private_key" && valid_short_id "$old_short_id"; then
         reuse_credentials=true
@@ -315,6 +358,79 @@ load_existing_warp() {
     warp_reserved=""
     warp_peer=""
     warp_endpoint=""
+}
+
+load_existing_warp_list() {
+    if [ ! -f "$WARP_SYNC_FILE" ] && [ ! -f "$WARP_SYNC_STATE_FILE" ]; then
+        info "未发现已安装的 WARP 订阅同步器，订阅 URL 默认值为 ${WARP_LIST_URL}"
+        return
+    fi
+    local url
+    url=$(head -n 1 "$WARP_SYNC_STATE_FILE" 2>/dev/null | tr -d '[:space:]' || true)
+    if valid_url "$url"; then
+        default_warp_list_url=$url
+        info "沿用已安装的 WARP 订阅 URL 作为默认值: ${url}"
+    else
+        info "已安装的 WARP 订阅 URL 不合法 (值: ${url:-空})，默认值仍为 ${WARP_LIST_URL}"
+    fi
+    warp_list_reuse=true
+}
+
+collect_warp_list() {
+    local raw=$1 line lineno=0 skipped=0 total=0 seen=$'\n'
+    warp_custom_domains=""
+    warp_custom_count=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno + 1))
+        line=${line%$'\r'}
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
+        if [ -z "$line" ] || [[ $line == \#* ]]; then
+            continue
+        fi
+        if ! valid_warp_line "$line"; then
+            warp_list_skipped+="第 ${lineno} 行: ${line}"$'\n'
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if [[ $seen == *$'\n'"$line"$'\n'* ]]; then
+            continue
+        fi
+        if [ "$total" -ge "$WARP_SYNC_MAX_LINES" ]; then
+            warp_list_truncated=true
+            break
+        fi
+        seen+="$line"$'\n'
+        warp_custom_domains+="$line"$'\n'
+        total=$((total + 1))
+    done <<<"$raw"
+    warp_custom_count=$total
+    warp_list_skipped_count=$skipped
+}
+
+fetch_warp_list() {
+    local raw code=0
+    mkdir -p "$CONFIG_DIR"
+    warp_list_skipped=""
+    warp_list_skipped_count=0
+    warp_list_truncated=false
+    raw=$(curl -fsS --max-time "$WARP_SYNC_FETCH_TIMEOUT" "$warp_list_url" 2>/dev/null) || code=$?
+    if [ "$code" -ne 0 ]; then
+        warp_list_status="拉取失败 (curl 退出码 ${code})"
+        info "注意: WARP 订阅列表拉取失败 (${warp_list_url}, curl 退出码 ${code})，本次仅使用内置分流域名"
+        return 1
+    fi
+    collect_warp_list "$raw"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        info "订阅列表非法行已跳过 (${line})"
+    done <<<"$warp_list_skipped"
+    if [ "$warp_list_truncated" = true ]; then
+        info "订阅列表超过 ${WARP_SYNC_MAX_LINES} 条上限，其余行忽略"
+    fi
+    info "订阅列表解析完成 (有效 ${warp_custom_count} 条, 跳过非法 ${warp_list_skipped_count} 行)"
+    printf '%s' "$warp_custom_domains" >"$WARP_LIST_FILE"
+    warp_list_status="已生效 (${warp_custom_count} 条自定义域名)"
 }
 
 load_existing_fallback() {
@@ -452,6 +568,35 @@ choose_warp() {
     fi
     warp_choice=$(read_yes_no "是否开启 Cloudflare WARP 分流 (AI 服务、Netflix、Disney+ 经 WARP 出站)" "$default_warp")
     info "WARP 分流: $(on_off "$warp_choice")"
+}
+
+choose_warp_list_url() {
+    if [ "$warp_list_reuse" = true ] && [ -z "${XRAY_WARP_LIST:-}" ]; then
+        warp_list_url=$default_warp_list_url
+        info "WARP 订阅列表: ${warp_list_url:-不启用} (沿用已安装的订阅)"
+        return
+    fi
+    if [ -n "${XRAY_WARP_LIST:-}" ]; then
+        valid_url "$XRAY_WARP_LIST" || fail "环境变量 XRAY_WARP_LIST=${XRAY_WARP_LIST} 不是合法的 https URL (不能含空格/引号/反斜杠)"
+        warp_list_url=$XRAY_WARP_LIST
+        info "WARP 订阅列表: ${warp_list_url} (来自环境变量 XRAY_WARP_LIST)"
+        return
+    fi
+    if ! has_tty; then
+        warp_list_url=$default_warp_list_url
+        info "WARP 订阅列表: ${warp_list_url} (无交互终端且未设置 XRAY_WARP_LIST，取默认值)"
+        return
+    fi
+    while true; do
+        read -r -p "WARP 订阅列表 URL (每天自动拉取, 留空 = 只用内置域名): " warp_list_url </dev/tty || warp_list_url=""
+        if [ -z "$warp_list_url" ]; then
+            info "WARP 订阅列表: 不启用 (只用内置分流域名)"
+            return
+        fi
+        valid_url "$warp_list_url" && break
+        info "${warp_list_url} 不是合法的 https URL (不能含空格/引号/反斜杠)，请重新输入"
+    done
+    info "WARP 订阅列表: ${warp_list_url}"
 }
 
 choose_fallback() {
@@ -705,11 +850,16 @@ EOF
 }
 
 render_warp_domains() {
-    local domain sep=""
-    for domain in "${WARP_DOMAINS[@]}"; do
-        printf '%s          "%s"' "$sep" "$domain"
-        sep=$',\n'
+    printf '          "%s"' "${WARP_DOMAINS[0]}"
+    local domain
+    for domain in "${WARP_DOMAINS[@]:1}"; do
+        printf ',\n          "%s"' "$domain"
     done
+    [ -n "$warp_custom_domains" ] || return 0
+    while IFS= read -r domain; do
+        [ -n "$domain" ] || continue
+        printf ',\n          "%s"' "$(json_escape "$domain")"
+    done <<<"$warp_custom_domains"
 }
 
 render_warp_routing() {
@@ -727,6 +877,282 @@ $(render_warp_domains)
     ]
   }
 EOF
+}
+
+render_warp_sync_script() {
+    local script
+    script=$(cat <<'WARP_SYNC_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly XRAY_IMAGE="teddysun/xray"
+readonly CONTAINER_NAME="xray-reality"
+readonly CONFIG_DIR="/etc/xray"
+readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
+readonly LIST_FILE="${CONFIG_DIR}/warp-domains.txt"
+readonly STATE_FILE="${CONFIG_DIR}/warp-sync-state"
+readonly STATE_TMP="${CONFIG_DIR}/warp-sync-state.tmp"
+readonly CONFIG_TMP="${CONFIG_DIR}/config.sync.json"
+readonly LOCK_DIR="${CONFIG_DIR}/warp-sync.lock"
+readonly FETCH_TIMEOUT=20
+readonly MAX_LINES=1000
+readonly LOCK_STALE_SECONDS=600
+readonly LOG_MAX_SIZE="10m"
+readonly LOG_MAX_FILE="3"
+readonly -a BUILTIN_DOMAINS=('geosite:category-ai-!cn' 'geosite:netflix' 'geosite:disney')
+readonly LIST_URL="__WARP_LIST_URL__"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+
+acquire_lock() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        return
+    fi
+    local age now mtime
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$LOCK_DIR" 2>/dev/null || echo "$now")
+    age=$((now - mtime))
+    if [ "$age" -lt "$LOCK_STALE_SECONDS" ]; then
+        log "skip, 已有同步在运行 (锁龄 ${age}s < ${LOCK_STALE_SECONDS}s)"
+        exit 0
+    fi
+    log "接管过期锁 (锁龄 ${age}s >= ${LOCK_STALE_SECONDS}s)"
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || { log "skip, 抢锁失败, 另一同步刚接管"; exit 0; }
+}
+
+valid_domain() {
+    local re='^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z][A-Za-z0-9-]{0,61}[A-Za-z0-9]$'
+    [ "${#1}" -le 253 ] && [[ $1 =~ $re ]]
+}
+
+valid_warp_line() {
+    case $1 in
+        full:*) valid_domain "${1#full:}" ;;
+        geosite:*) [[ ${1#geosite:} =~ ^[A-Za-z0-9@!_-]+$ ]] ;;
+        keyword:*) [[ ${1#keyword:} =~ ^[A-Za-z0-9._-]+$ ]] ;;
+        regexp:*) [[ -n ${1#regexp:} && ${1#regexp:} != *[[:space:]]* ]] ;;
+        *) valid_domain "$1" ;;
+    esac
+}
+
+json_escape() {
+    local value=${1//\\/\\\\}
+    printf '%s' "${value//\"/\\\"}"
+}
+
+collect_list() {
+    local raw=$1 line lineno=0 skipped=0 total=0 seen=$'\n'
+    list_domains=""
+    list_count=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno + 1))
+        line=${line%$'\r'}
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
+        if [ -z "$line" ] || [[ $line == \#* ]]; then
+            continue
+        fi
+        if ! valid_warp_line "$line"; then
+            log "skip, 非法行不写入规则, 第 ${lineno} 行: ${line}"
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if [[ $seen == *$'\n'"$line"$'\n'* ]]; then
+            continue
+        fi
+        if [ "$total" -ge "$MAX_LINES" ]; then
+            log "skip, 超过 ${MAX_LINES} 条上限, 其余行忽略"
+            break
+        fi
+        seen+="$line"$'\n'
+        list_domains+="$line"$'\n'
+        total=$((total + 1))
+    done <<<"$raw"
+    list_count=$total
+    log "done, 列表解析完成, 有效 ${total} 条, 跳过非法 ${skipped} 行"
+}
+
+render_domains() {
+    printf '          "%s"' "${BUILTIN_DOMAINS[0]}"
+    local domain
+    for domain in "${BUILTIN_DOMAINS[@]:1}"; do
+        printf ',\n          "%s"' "$domain"
+    done
+    [ -n "$list_domains" ] || return 0
+    while IFS= read -r domain; do
+        [ -n "$domain" ] || continue
+        printf ',\n          "%s"' "$(json_escape "$domain")"
+    done <<<"$list_domains"
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+    log "fail, 需要 root 运行 (当前 uid: $(id -u))"
+    exit 1
+fi
+if [ ! -f "$CONFIG_FILE" ]; then
+    log "fail, 缺少节点配置 ${CONFIG_FILE}, 请先执行安装"
+    exit 1
+fi
+if ! grep -q '"protocol": *"wireguard"' "$CONFIG_FILE"; then
+    log "skip, 现有配置未开启 WARP, 不同步 (重开 WARP 请重跑安装)"
+    exit 0
+fi
+acquire_lock
+trap 'rm -rf "$LOCK_DIR"; rm -f "$CONFIG_TMP" "$STATE_TMP"' EXIT
+
+raw=$(curl -fsS --max-time "$FETCH_TIMEOUT" "$LIST_URL" 2>/dev/null) || {
+    log "fail, 订阅列表拉取失败 (curl 退出码 $?, url: ${LIST_URL}), 保持现有配置"
+    exit 0
+}
+list_domains=""
+collect_list "$raw"
+
+old_hash=""
+if [ -f "$STATE_FILE" ]; then
+    old_hash=$(sed -n 2p "$STATE_FILE" | tr -d '[:space:]')
+fi
+new_hash=$(printf '%s' "$list_domains" | sha256sum | awk '{print $1}')
+if [ "$new_hash" = "$old_hash" ]; then
+    log "done, 订阅列表无变化, 不重建容器 (hash: ${new_hash:0:12})"
+    exit 0
+fi
+if ! docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+    log "fail, 容器 ${CONTAINER_NAME} 不存在, 无法应用, 请先执行安装"
+    exit 0
+fi
+if ! grep -q '^  "routing": {$' "$CONFIG_FILE"; then
+    log "fail, 配置里找不到脚本生成的 routing 段 (可能被手工改过), 保持现有配置"
+    exit 0
+fi
+
+sed '/^  "routing": {$/,$d' "$CONFIG_FILE" >"$CONFIG_TMP"
+cat >>"$CONFIG_TMP" <<ROUTING_EOF
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "domain": [
+$(render_domains)
+        ],
+        "outboundTag": "warp"
+      }
+    ]
+  }
+}
+ROUTING_EOF
+
+if ! output=$(docker run --rm -v "${CONFIG_DIR}:${CONFIG_DIR}" "$XRAY_IMAGE" xray run -test -c "$CONFIG_TMP" 2>&1); then
+    log "fail, 新配置未通过 xray run -test, 保持现有配置: $(printf '%s' "$output" | tail -n 1)"
+    exit 0
+fi
+
+mv "$CONFIG_FILE" "${CONFIG_FILE}.before-sync"
+mv -f "$CONFIG_TMP" "$CONFIG_FILE"
+docker rm -f -v "$CONTAINER_NAME" >/dev/null
+if ! docker run -d \
+    --name "$CONTAINER_NAME" \
+    --restart always \
+    --net host \
+    --log-driver json-file \
+    --log-opt max-size="$LOG_MAX_SIZE" \
+    --log-opt max-file="$LOG_MAX_FILE" \
+    -v "${CONFIG_DIR}:${CONFIG_DIR}" \
+    "$XRAY_IMAGE" >/dev/null; then
+    mv -f "${CONFIG_FILE}.before-sync" "$CONFIG_FILE"
+    docker run -d --name "$CONTAINER_NAME" --restart always --net host --log-driver json-file --log-opt max-size="$LOG_MAX_SIZE" --log-opt max-file="$LOG_MAX_FILE" -v "${CONFIG_DIR}:${CONFIG_DIR}" "$XRAY_IMAGE" >/dev/null 2>&1 || true
+    log "fail, 新容器启动失败, 已按旧配置回滚容器"
+    exit 1
+fi
+sleep 2
+status=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo missing)
+if [ "$status" != running ]; then
+    mv -f "${CONFIG_FILE}.before-sync" "$CONFIG_FILE"
+    docker rm -f -v "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    docker run -d --name "$CONTAINER_NAME" --restart always --net host --log-driver json-file --log-opt max-size="$LOG_MAX_SIZE" --log-opt max-file="$LOG_MAX_FILE" -v "${CONFIG_DIR}:${CONFIG_DIR}" "$XRAY_IMAGE" >/dev/null 2>&1 || true
+    log "fail, 新容器未稳定运行 (状态: ${status}), 已按旧配置回滚容器"
+    exit 1
+fi
+rm -f "${CONFIG_FILE}.before-sync"
+{ printf '%s\n%s\n' "$LIST_URL" "$new_hash"; } >"$STATE_TMP"
+mv -f "$STATE_TMP" "$STATE_FILE"
+printf '%s' "$list_domains" >"$LIST_FILE"
+log "done, 订阅已应用并重建容器 (自定义规则 ${list_count} 条, hash: ${new_hash:0:12})"
+WARP_SYNC_EOF
+)
+    printf '%s\n' "${script//__WARP_LIST_URL__/$warp_list_url}"
+}
+
+remove_warp_sync() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now "${WARP_SYNC_UNIT}.timer" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/${WARP_SYNC_UNIT}.timer" "/etc/systemd/system/${WARP_SYNC_UNIT}.service"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if command -v crontab >/dev/null 2>&1 && crontab -l >/dev/null 2>&1; then
+        local current
+        current=$(crontab -l 2>/dev/null || true)
+        if [[ $current == *"$WARP_SYNC_CRON_MARK"* ]]; then
+            { grep -vF "$WARP_SYNC_CRON_MARK" <<<"$current" || true; } | crontab - 2>/dev/null || true
+        fi
+    fi
+    rm -f "$WARP_SYNC_FILE" "$WARP_SYNC_STATE_FILE" "$WARP_LIST_FILE"
+    rm -rf "${CONFIG_DIR}/warp-sync.lock"
+}
+
+setup_warp_sync() {
+    remove_warp_sync
+    if [ -z "$warp_list_url" ]; then
+        warp_sync_status="不启用"
+        info "WARP 订阅同步: 未启用 (只用内置分流域名)"
+        return
+    fi
+    tmp_warp_sync_script=$(mktemp)
+    render_warp_sync_script >"$tmp_warp_sync_script"
+    chmod 700 "$tmp_warp_sync_script"
+    mv -f "$tmp_warp_sync_script" "$WARP_SYNC_FILE"
+    tmp_warp_sync_script=""
+    { printf '%s\n' "$warp_list_url"; } >"$WARP_SYNC_STATE_FILE"
+    if command -v systemctl >/dev/null 2>&1; then
+        cat >"/etc/systemd/system/${WARP_SYNC_UNIT}.service" <<EOF
+[Unit]
+Description=Xray WARP domain list sync
+
+[Service]
+Type=oneshot
+ExecStart=${WARP_SYNC_FILE}
+EOF
+        cat >"/etc/systemd/system/${WARP_SYNC_UNIT}.timer" <<EOF
+[Unit]
+Description=Daily Xray WARP domain list sync
+
+[Timer]
+OnCalendar=${WARP_SYNC_INTERVAL}
+Persistent=true
+RandomizedDelaySec=${WARP_SYNC_JITTER_SECONDS}
+
+[Install]
+WantedBy=timers.target
+EOF
+        if systemctl daemon-reload && systemctl enable --now "${WARP_SYNC_UNIT}.timer" >/dev/null 2>&1; then
+            warp_sync_status="已启用 (systemd timer ${WARP_SYNC_UNIT}.timer, 每天一次)"
+            info "WARP 订阅同步: ${warp_sync_status}；改完 GitHub 上的列表最迟一天生效，想立即生效执行 ${WARP_SYNC_FILE}"
+            return
+        fi
+        info "注意: systemd timer 启用失败，改用 cron"
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        local current minute hour
+        current=$(crontab -l 2>/dev/null || true)
+        minute=$((RANDOM % 60))
+        hour=$((RANDOM % 24))
+        { grep -vF "$WARP_SYNC_CRON_MARK" <<<"$current" || true; printf '%s %s * * * %s %s\n' "$minute" "$hour" "$WARP_SYNC_FILE" "$WARP_SYNC_CRON_MARK"; } | crontab - || fail "写入 root crontab 失败，无法启用 WARP 订阅同步"
+        warp_sync_status="已启用 (cron 每天 ${hour}:$(printf '%02d' "$minute") 一次)"
+        info "WARP 订阅同步: ${warp_sync_status}；想立即生效执行 ${WARP_SYNC_FILE}"
+        return
+    fi
+    warp_sync_status="未启用 (系统无 systemctl 也无 crontab)"
+    info "注意: 系统既无 systemctl 也无 crontab，订阅同步无法定时运行；可手动执行 ${WARP_SYNC_FILE} 拉取一次"
 }
 
 render_warp_check_config() {
@@ -804,12 +1230,15 @@ check_warp() {
 
 skip_warp() {
     warp_enabled=false
+    warp_list_url=""
+    warp_list_status=""
     warp_status="未开启 (开启失败已跳过: ${warp_failure})"
     info "注意: ${warp_failure}，本次跳过 WARP，Reality 照常安装"
 }
 
 setup_warp() {
     if [ "$warp_choice" != y ]; then
+        warp_list_url=""
         warp_status="未开启"
         if [ "$default_warp" = y ]; then
             info "跳过 WARP: 本次选择不开启，已安装的 WARP 出站将从配置中移除"
@@ -818,6 +1247,7 @@ setup_warp() {
         fi
         return
     fi
+    choose_warp_list_url
     if [ "$reuse_warp" = true ]; then
         info "复用已有 WARP 账号 (地址: ${warp_v4}, ${warp_v6})，不重新注册"
     else
@@ -831,8 +1261,16 @@ setup_warp() {
         skip_warp
         return
     fi
+    if [ -n "$warp_list_url" ]; then
+        fetch_warp_list || true
+    fi
     warp_enabled=true
     warp_status="已开启 (AI 服务 / Netflix / Disney+ 经 WARP 出站，IPv4 优先)"
+    if [ -n "$warp_list_url" ]; then
+        warp_status+="，订阅 ${warp_list_url} (${warp_list_status})"
+    else
+        warp_list_status="不启用 (只用内置分流域名)"
+    fi
 }
 
 setup_fallback() {
@@ -1154,6 +1592,7 @@ ShortId:     ${hl}${short_id}${off}
 ========================================
 BBR 加速:    ${hl}${bbr_status}${off}
 WARP 分流:   ${hl}${warp_status}${off}
+WARP 订阅:   ${hl}${warp_sync_status}${off}
 回落限速:    ${hl}${fallback_status}${off}
 ========================================
 
@@ -1259,6 +1698,7 @@ install_xray() {
     write_and_test_config
     start_container
     wait_for_xray
+    setup_warp_sync
     open_firewall
     enable_bbr
     show_result

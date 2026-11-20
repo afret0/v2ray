@@ -23,6 +23,14 @@
 - 官方最佳实践是「偷同 ASN 的证书」，其次要求 TLS1.3 + X25519（最好 X25519MLKEM768）、非共享免费 CDN、国内未被墙。验证命令：`docker run --rm teddysun/xray xray tls ping <域名>`，看 `Handshake succeeded` / `TLS 1.3` / `Post-Quantum ... true` / 证书链长度。批量扫同 ASN 用 XTLS/RealiTLScanner。
 - **回落限速默认关闭**，`XRAY_FALLBACK_LIMIT=y` 才开：官方文档明确「回落限速是一种特征，不建议启用，面板/一键脚本开发者务必让参数随机化」。所以六个值各自在中心值 ±`FALLBACK_JITTER_PERCENT`% 内随机（`jitter_value`），**禁止改回写死常量**——那会让所有装机行为一致，成为批量指纹。重装复用已装值（`load_existing_fallback` + `reuse_fallback`），与 WARP 账号复用同一套模式。
 
+## WARP 订阅列表的既定设计（用户确认过）
+
+- 列表源默认本仓库 [warp-domains.txt](../warp-domains.txt) 的 raw URL，**追加**到内置三条 geosite（内置永远在）；每行裸域名或 `full:`/`keyword:`/`regexp:`/`geosite:` 前缀，`#` 只支持整行注释；非法行**跳过并记日志**不清空列表；同步周期 1 天。改这些语义前先问。
+- 同步器是 `render_warp_sync_script` 用带引号 heredoc 内嵌生成的独立脚本（占位符 `__WARP_LIST_URL__` 替换），落到 `/etc/xray/warp-sync.sh`，由 systemd timer（无 systemd 落 cron，行尾 `# xray warp sync` 标记去重）驱动。`update` 子命令不碰同步器。
+- **同步器改配置靠精确缩进截断**：`grep '^  "routing": {$'` 找到脚本生成的 routing 段（config 的最后一个顶层键），`sed '/^  "routing": {$/,$d'` 截掉再追加新 routing + 收尾 `}`。改 `render_config` 的 routing 缩进/位置必须同步改内嵌脚本，否则同步器判定「被手工改过」拒绝工作。
+- 变化判定用**解析后域文的 sha256**（状态文件第 2 行；第 1 行是 URL），不是原始下载内容——改注释不触发重建。任何失败（拉取 / `xray run -test` / 容器起不来）都保持旧配置，容器失败回滚靠 `config.json.before-sync`。重建失败或校验失败一律 `exit 0`（timer 不算 fail），只有回滚类硬失败 `exit 1`。
+- 重装沿用已装 URL（`load_existing_warp_list` 读状态文件第 1 行，与 WARP 账号复用同一模式）；关 WARP 时 `remove_warp_sync` 连 timer/cron/状态/列表文件一起清。3x-ui 接管把列表文件**快照**进面板模板并移除同步器（`remove_warp_sync` 在 3xui 里**保留** `warp-domains.txt` 作记录），只在 `wait_node_listening` 成功后调用——回滚路径必须保留同步器。
+
 ## 已验证的坑
 
 - `ensure_image` 见到本地已有镜像就跳过 `docker pull`，所以**重装不会更新内核与 geosite/geoip**；更新只能走 `update` 子命令，别把 pull 塞回安装路径。
@@ -33,15 +41,21 @@
 - 在 harness 里 `source` 脚本副本会连带继承 `set -Eeuo pipefail` 与 ERR trap，测试脚本里断言「某命令应当失败」前必须 `set +e +E; trap - ERR`，否则第一条负面断言就会中断整个测试。
 - 随机化相关的断言不能写死次数/顺序：候选池打乱后「探测了几个」「有没有降级日志」都随顺序变化，断言要写成区间或条件式，否则测试会随机红。
 - 客户端信息文件含 UUID / 私钥推导出的公钥，落盘一律 `(umask 077 && render_xxx >file)`。
+- bash 内联正则里写 `[^\"\\...]` 会误拒 `\.`（`regexp:` 规则必需）：字符类先赋给 `local re='...'` 变量再 `[[ $1 =~ $re ]]`，或放宽 `regexp:` 体校验（非空、无空白）改用 `json_escape` 兜住转义。
+- `while read <<<"$empty_var"` 会迭代一次空串：遍历域名列前先 `[ -n "$list" ] || return 0`。
+- 测试脚本里 `grep -c` 无匹配退出码 1 会触发继承的 ERR trap（「错误: ... (退出码 0)」的假失败）：负面/计数断言放 `if` 条件里，别裸跑；`source` 之后要**再** `set +e +E; trap - ERR` 一次（source 会重新装上脚本的 trap）。
+- PATH 收窄到 stub 目录跑分支测试时，stub 内部用到的每个外部命令（`dirname`、`ls`…）都要有 symlink；`mv` 走 stub 后要 `hash -r`，否则 bash 哈希表让 `command -v` 仍命中旧路径。
+- 同步器/订阅的分支断言每个 case 前要**追加新域名**制造 hash 变化并快照 config 用 `cmp` 对比——复用上个 case 的列表会落进「无变化」分支产生假失败；沙箱复跑前清空状态文件，残留状态同样污染断言。
 
 ## 验证命令（macOS 本机可跑，已实测）
 
 ```bash
 bash -n onekey_xray.sh
 docker run --rm -v "$PWD:/mnt:ro" koalaman/shellcheck:stable -S style /mnt/onekey_xray.sh
+docker run --rm -v "$PWD:/mnt:ro" koalaman/shellcheck:stable -S style /mnt/onekey_3xui.sh
 ```
 
-基线：shellcheck 全 severity 零告警，改完必须保持零告警（本机没装 shellcheck，用上面的 docker 方式跑）。
+基线：shellcheck 全 severity 零告警，改完必须保持零告警（本机没装 shellcheck，用上面的 docker 方式跑；容器里报 `commitBuffer: invalid argument` 编码错时加 `-e LANG=C.UTF-8 -f gcc` 看真实告警位置）。内嵌的 warp-sync 脚本单独提取出来 `bash -n` + shellcheck（`render_warp_sync_script` 在 harness 里调用一次即可拿到成品）。`printf` 的格式串里不许放变量（SC2059），动态值走 `%s` 传参。
 
 真实内核与客户端校验（Docker Desktop 可用时）：把脚本去掉末行 `main "$@"` 后 `source` 进临时 harness，设好 `sni/port/uuid/private_key/public_key/short_id/server_ip/warp_*`，调用 `render_config` / `render_clash_config`，然后
 

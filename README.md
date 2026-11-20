@@ -18,6 +18,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/afret0/v2ray/master/onekey_x
 | 监听端口 | `443` |
 | 是否开启 BBR 加速 | 开启 |
 | 是否开启 Cloudflare WARP 分流 | 不开启 |
+| WARP 订阅列表 URL（开启 WARP 后追问） | 本仓库 [warp-domains.txt](./warp-domains.txt) 的 raw 地址，重装时沿用已装值，留空 = 不启用订阅 |
 | 是否开启 REALITY 回落限速 | 不开启 |
 
 安装完成后会打印客户端配置、`vless://` 分享链接与 Clash / mihomo 节点片段，导入客户端即可使用。
@@ -36,6 +37,7 @@ XRAY_SNI=www.samsung.com XRAY_PORT=443 XRAY_BBR=y XRAY_WARP=n XRAY_FALLBACK_LIMI
 | `XRAY_PORT` | 监听端口，1-65535 | `443`，重装时为已安装的值 |
 | `XRAY_BBR` | 是否开启 BBR，`y` / `n` | `y` |
 | `XRAY_WARP` | 是否开启 WARP 分流，`y` / `n` | `n`，重装时为已安装的状态 |
+| `XRAY_WARP_LIST` | WARP 订阅列表 URL（https），每天自动拉取追加进 WARP 分流 | 本仓库 `warp-domains.txt` 的 raw 地址，重装时为已安装的值 |
 | `XRAY_FALLBACK_LIMIT` | 是否开启 REALITY 回落限速，`y` / `n` | `n`，重装时为已安装的状态 |
 
 ## 脚本做了什么
@@ -135,6 +137,17 @@ proxies:
 - 安装时自动注册免费 WARP 账号并检测连通性，注册失败或连不通时跳过 WARP，Reality 照常安装；
 - 重装时沿用已安装的 WARP 状态并复用 WARP 账号，不会重复注册。
 
+### WARP 订阅列表（改列表不登服务器）
+
+内置三条 geosite 之外，可以再挂一个**远程域名订阅**：你在 GitHub 网页 / 手机上编辑列表文件，服务器每天自动拉取，内容变化时校验通过后自动应用，不用登录服务器。
+
+- 列表默认用本仓库的 [warp-domains.txt](./warp-domains.txt)（fork 后改自己仓库的文件，并用 `XRAY_WARP_LIST` 指向自己的 raw 地址）；安装时输入其它 https URL 也行，留空 = 不启用订阅；
+- **格式**：每行一条规则，`#` 开头整行为注释、空行忽略、不支持行尾注释。裸域名 = 该域名及其全部子域名走 WARP；也支持 Xray 原生前缀 `full:`（精确匹配）、`keyword:`、`regexp:`、`geosite:`；非法行**跳过并记日志**，其余行照常生效；重复行去重；上限 1000 条；
+- **机制**：同步器 `/etc/xray/warp-sync.sh` 由 systemd timer（`xray-warp-sync.timer`，每天一次，随机延迟半小时内；无 systemd 时落 cron）驱动：拉取 → 解析 → 内容与上次相同则什么都不做；变化时把「内置 + 订阅」重写进 `routing`，先 `xray run -test` 校验，通过才重建容器（秒级断线）；校验失败或拉取失败都**保持现有配置**，下轮重试；新容器起不来时按旧配置自动回滚；
+- 装完当场就拉取一次并入首份配置（拉取失败只提示，节点照常装）；重装沿用已装 URL（`XRAY_WARP_LIST` 可覆盖）；**关闭 WARP 时同步器一并移除**；
+- 手动立即同步：`bash /etc/xray/warp-sync.sh`；看同步日志：`journalctl -u xray-warp-sync.service`；
+- `update` 子命令不动订阅与同步器；3x-ui 面板接管时会把**上次成功同步的订阅快照**一并写进面板模板并移除同步器，之后在面板里管理分流。
+
 ## 重装 / 修改配置
 
 再次执行一键安装命令即可。脚本会复用 `/etc/xray/config.json` 里的 UUID、密钥与 ShortId，SNI、端口与 WARP 状态默认沿用已安装的值；只改了端口或 SNI 时，客户端改对应字段即可。修改端口后，旧端口的防火墙放行规则不会自动删除，脚本会打印删除命令。
@@ -157,7 +170,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/afret0/v2ray/master/onekey_3
 脚本做的事：
 
 1. **没装过节点**：先调用本仓库的 `onekey_xray.sh` 安装 Reality 节点（同目录有该文件就用本地的，没有就从本仓库下载；SNI / 端口 / BBR / WARP / 回落限速的交互提问原样透传，也可先用 `XRAY_*` 环境变量装好节点再跑面板脚本）；
-2. **已装过节点**：读取 `/etc/xray/config.json`，把端口、SNI、UUID、私钥、ShortId **原样**建成面板入站，**旧客户端一个都不用重新导入**；回落限速的六个随机值原样带入（3x-ui 的 Reality 表单支持 `limitFallbackUpload/Download`）；WARP 账号与三条分流规则写入面板的 Xray 模板（出站 tag 为 `warp`，之后可在面板 WARP 页换 IP / 填 license）；
+2. **已装过节点**：读取 `/etc/xray/config.json`，把端口、SNI、UUID、私钥、ShortId **原样**建成面板入站，**旧客户端一个都不用重新导入**；回落限速的六个随机值原样带入（3x-ui 的 Reality 表单支持 `limitFallbackUpload/Download`）；WARP 账号与分流规则（内置三条 + 订阅列表快照）写入面板的 Xray 模板（出站 tag 为 `warp`，之后可在面板 WARP 页换 IP / 填 license），接管成功后移除 WARP 订阅定时同步器；
 3. Docker 部署官方 `ghcr.io/mhsanaei/3x-ui` 镜像（host 网络，容器名 `3x-ui`，数据库持久化在 `/etc/x-ui`，日志 10MB × 3 份轮转）；面板端口在 20000-60000 随机选取（可用 `XUI_PORT` 指定），用户名 / 密码 / 访问路径全部随机生成；
 4. 通过面板 API 建好入站并校验通过后，才移除旧的 `xray-reality` 容器让出端口；面板 Xray 未在 15 秒内监听端口时**自动回滚**：禁用面板入站并按原配置恢复旧容器；`/etc/xray` 下的旧配置与客户端信息始终保留，可随时手动回退；
 5. 打印并保存面板地址 / 账号 / 密码到 `/etc/x-ui/panel-info.txt`（仅 root 可读），ufw / firewalld 启用时自动放行面板端口。
@@ -182,6 +195,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/afret0/v2ray/master/onekey_3
 | 重启 | `docker restart xray-reality` |
 | 开启回落限速 | `XRAY_FALLBACK_LIMIT=y bash <(curl -fsSL https://raw.githubusercontent.com/afret0/v2ray/master/onekey_xray.sh)` |
 | 关闭 WARP 分流 | `XRAY_WARP=n bash <(curl -fsSL https://raw.githubusercontent.com/afret0/v2ray/master/onekey_xray.sh)` |
+| 立即同步 WARP 订阅列表 | `bash /etc/xray/warp-sync.sh` |
+| 查看 WARP 订阅同步日志 | `journalctl -u xray-warp-sync.service` |
+| 更换 WARP 订阅列表 URL | `XRAY_WARP_LIST=<https-url> bash <(curl -fsSL https://raw.githubusercontent.com/afret0/v2ray/master/onekey_xray.sh)` |
 | 关闭 BBR | `rm -f /etc/sysctl.d/99-xray-bbr.conf` 后重启服务器 |
 | 安装 3x-ui 面板（多用户管理） | `bash <(curl -fsSL https://raw.githubusercontent.com/afret0/v2ray/master/onekey_3xui.sh)` |
 | 查看面板地址与账密 | `cat /etc/x-ui/panel-info.txt` |

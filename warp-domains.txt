@@ -1,0 +1,9 @@
+# WARP 分流域名订阅列表 (每行一个域名, 该域名及其全部子域名都会经 WARP 出站)
+# # 开头的行为注释, 空行忽略, 不支持行尾注释
+# 支持 Xray 原生前缀: full: 精确匹配 / keyword: 关键词 / regexp: 正则 / geosite: 分类
+# 内置的 geosite:category-ai-!cn / geosite:netflix / geosite:disney 始终生效, 无需写在这里
+# 在 GitHub 网页上直接编辑本文件, 服务器每天自动拉取一次, 内容变化时校验通过后自动应用
+
+example.com
+full:exact.example.org
+# geosite:google

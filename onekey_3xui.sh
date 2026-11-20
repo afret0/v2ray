@@ -24,6 +24,11 @@ readonly LOG_MAX_FILE="3"
 readonly WARP_MTU=1280
 readonly WARP_TARGET_STRATEGY="ForceIPv4v6"
 readonly -a WARP_DOMAINS=('geosite:category-ai-!cn' 'geosite:netflix' 'geosite:disney')
+readonly WARP_LIST_FILE="${NODE_CONFIG_DIR}/warp-domains.txt"
+readonly WARP_SYNC_FILE="${NODE_CONFIG_DIR}/warp-sync.sh"
+readonly WARP_SYNC_STATE_FILE="${NODE_CONFIG_DIR}/warp-sync-state"
+readonly WARP_SYNC_UNIT="xray-warp-sync"
+readonly WARP_SYNC_CRON_MARK="# xray warp sync"
 
 readonly GREEN=$'\033[0;32m'
 readonly YELLOW=$'\033[1;33m'
@@ -44,6 +49,8 @@ warp_v6=""
 warp_reserved=""
 warp_peer=""
 warp_endpoint=""
+warp_custom_domains=""
+warp_custom_count=0
 fallback_enabled=false
 fallback_up_after=""
 fallback_up_rate=""
@@ -133,6 +140,25 @@ credential_state() {
 
 json_string() {
     { grep -oE "$2" <<<"$1" || true; } | awk -F'"' 'NR == 1 {print $4}'
+}
+
+json_escape() {
+    local value=${1//\\/\\\\}
+    printf '%s' "${value//\"/\\\"}"
+}
+
+load_warp_list_snapshot() {
+    if [ ! -f "$WARP_LIST_FILE" ]; then
+        info "节点未启用 WARP 订阅列表或从未同步成功，面板模板只带内置分流域名"
+        return
+    fi
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        warp_custom_domains+="$line"$'\n'
+        warp_custom_count=$((warp_custom_count + 1))
+    done <"$WARP_LIST_FILE"
+    info "WARP 订阅列表快照: ${warp_custom_count} 条自定义域名一并迁入面板，之后由面板管理 (快照来自上次成功同步)"
 }
 
 first_match() {
@@ -257,6 +283,7 @@ load_node_warp() {
     fi
     warp_enabled=true
     info "已有节点开启了 WARP (地址: ${warp_v4}, ${warp_v6})，账号原样迁入面板模板，出站 tag 为 warp，可在面板 WARP 页继续管理"
+    load_warp_list_snapshot
 }
 
 load_node_fallback() {
@@ -571,11 +598,16 @@ EOF
 }
 
 render_warp_domains() {
-    local domain sep=""
-    for domain in "${WARP_DOMAINS[@]}"; do
-        printf '%s          "%s"' "$sep" "$domain"
-        sep=$',\n'
+    printf '          "%s"' "${WARP_DOMAINS[0]}"
+    local domain
+    for domain in "${WARP_DOMAINS[@]:1}"; do
+        printf ',\n          "%s"' "$domain"
     done
+    [ -n "$warp_custom_domains" ] || return 0
+    while IFS= read -r domain; do
+        [ -n "$domain" ] || continue
+        printf ',\n          "%s"' "$(json_escape "$domain")"
+    done <<<"$warp_custom_domains"
 }
 
 render_panel_template() {
@@ -690,7 +722,32 @@ migrate_panel_template() {
     fi
     response=$(api_post_form /xray/update \
         --data-urlencode "xraySetting=$(render_panel_template)") || fail "写入面板 Xray 模板失败 (响应: ${response:0:300})，旧容器与配置保持原样"
-    info "WARP 出站与分流规则已迁入面板 Xray 模板并通过面板校验 (AI / Netflix / Disney+ 走 warp 出站)"
+    if [ "$warp_custom_count" -gt 0 ]; then
+        info "WARP 出站与分流规则已迁入面板 Xray 模板并通过面板校验 (内置 AI / Netflix / Disney+ 加订阅快照 ${warp_custom_count} 条走 warp 出站)"
+    else
+        info "WARP 出站与分流规则已迁入面板 Xray 模板并通过面板校验 (AI / Netflix / Disney+ 走 warp 出站)"
+    fi
+}
+
+remove_warp_sync() {
+    if [ ! -f "$WARP_SYNC_FILE" ] && [ ! -f "$WARP_SYNC_STATE_FILE" ]; then
+        return
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now "${WARP_SYNC_UNIT}.timer" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/${WARP_SYNC_UNIT}.timer" "/etc/systemd/system/${WARP_SYNC_UNIT}.service"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if command -v crontab >/dev/null 2>&1 && crontab -l >/dev/null 2>&1; then
+        local current
+        current=$(crontab -l 2>/dev/null || true)
+        if [[ $current == *"$WARP_SYNC_CRON_MARK"* ]]; then
+            { grep -vF "$WARP_SYNC_CRON_MARK" <<<"$current" || true; } | crontab - 2>/dev/null || true
+        fi
+    fi
+    rm -f "$WARP_SYNC_FILE" "$WARP_SYNC_STATE_FILE"
+    rm -rf "${NODE_CONFIG_DIR}/warp-sync.lock"
+    info "WARP 订阅定时同步器已移除，订阅域名已快照进面板，之后改分流规则请在面板的 Xray 模板里操作 (${WARP_LIST_FILE} 保留作快照记录)"
 }
 
 remove_node_container() {
@@ -830,6 +887,7 @@ render_panel_info() {
 接管节点:    ${hl}Reality-${server_ip}${off} (端口 ${port}, SNI ${sni})
 迁移用户:    ${hl}${CLIENT_EMAIL}${off} (原 UUID，旧客户端无需重新导入)
 WARP 分流:   ${hl}$([ "$warp_enabled" = true ] && printf '已迁入面板模板 (warp 出站)' || printf '未开启')${off}
+WARP 订阅:   ${hl}$([ "$warp_custom_count" -gt 0 ] && printf '快照 %s 条已迁入面板, 定时同步器已移除' "$warp_custom_count" || printf '无订阅快照')${off}
 回落限速:    ${hl}$([ "$fallback_enabled" = true ] && printf '已原样迁入' || printf '未开启')${off}
 ========================================
 数据库:      ${XUI_DB_DIR} (容器重建不丢数据)
@@ -873,6 +931,7 @@ install_panel() {
     migrate_panel_template
     handover_to_panel
     wait_node_listening
+    remove_warp_sync
     open_panel_firewall
     show_panel_result
 }
