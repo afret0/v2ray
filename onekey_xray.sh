@@ -588,8 +588,14 @@ choose_warp_list_url() {
         return
     fi
     while true; do
-        read -r -p "WARP 订阅列表 URL (每天自动拉取, 留空 = 只用内置域名): " warp_list_url </dev/tty || warp_list_url=""
+        read -r -p "WARP 订阅列表 URL (每天自动拉取, 留空 = 默认列表, 输入 n = 不启用): " warp_list_url </dev/tty || warp_list_url=""
         if [ -z "$warp_list_url" ]; then
+            warp_list_url=$default_warp_list_url
+            info "WARP 订阅列表: ${warp_list_url} (默认列表)"
+            return
+        fi
+        if [ "$warp_list_url" = n ]; then
+            warp_list_url=""
             info "WARP 订阅列表: 不启用 (只用内置分流域名)"
             return
         fi
@@ -1557,11 +1563,11 @@ enable_bbr() {
 render_clash_config() {
     cat <<EOF
 proxies:
-  - name: "Reality-${server_ip}"
+  - name: Reality-${server_ip}
     type: vless
-    server: "${server_ip}"
+    server: ${server_ip}
     port: ${port}
-    uuid: "${uuid}"
+    uuid: ${uuid}
     flow: ${FLOW}
     network: tcp
     tls: true
@@ -1569,8 +1575,8 @@ proxies:
     client-fingerprint: ${FINGERPRINT}
     servername: ${sni}
     reality-opts:
-      public-key: "${public_key}"
-      short-id: "${short_id}"
+      public-key: ${public_key}
+      short-id: ${short_id}
 EOF
 }
 

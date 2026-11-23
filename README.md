@@ -18,7 +18,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/afret0/v2ray/master/onekey_x
 | 监听端口 | `443` |
 | 是否开启 BBR 加速 | 开启 |
 | 是否开启 Cloudflare WARP 分流 | 不开启 |
-| WARP 订阅列表 URL（开启 WARP 后追问） | 本仓库 [warp-domains.txt](./warp-domains.txt) 的 raw 地址，重装时沿用已装值，留空 = 不启用订阅 |
+| WARP 订阅列表 URL（开启 WARP 后追问） | 本仓库 [warp-domains.txt](./warp-domains.txt) 的 raw 地址（留空即取它），重装时沿用已装值，输入 `n` = 不启用订阅 |
 | 是否开启 REALITY 回落限速 | 不开启 |
 
 安装完成后会打印客户端配置、`vless://` 分享链接与 Clash / mihomo 节点片段，导入客户端即可使用。
@@ -107,11 +107,11 @@ REALITY 会把认证失败的连接原样转发到伪装站，服务器因此可
 
 ```yaml
 proxies:
-  - name: "Reality-203.0.113.10"
+  - name: Reality-203.0.113.10
     type: vless
-    server: "203.0.113.10"
+    server: 203.0.113.10
     port: 443
-    uuid: "<UUID>"
+    uuid: <UUID>
     flow: xtls-rprx-vision
     network: tcp
     tls: true
@@ -119,8 +119,8 @@ proxies:
     client-fingerprint: chrome
     servername: www.samsung.com
     reality-opts:
-      public-key: "<PublicKey>"
-      short-id: "<ShortId>"
+      public-key: <PublicKey>
+      short-id: <ShortId>
 ```
 
 ## BBR 加速
@@ -141,7 +141,7 @@ proxies:
 
 内置三条 geosite 之外，可以再挂一个**远程域名订阅**：你在 GitHub 网页 / 手机上编辑列表文件，服务器每天自动拉取，内容变化时校验通过后自动应用，不用登录服务器。
 
-- 列表默认用本仓库的 [warp-domains.txt](./warp-domains.txt)（fork 后改自己仓库的文件，并用 `XRAY_WARP_LIST` 指向自己的 raw 地址）；安装时输入其它 https URL 也行，留空 = 不启用订阅；
+- 列表默认用本仓库的 [warp-domains.txt](./warp-domains.txt)（fork 后改自己仓库的文件，并用 `XRAY_WARP_LIST` 指向自己的 raw 地址）；安装时**留空即取默认列表**，输入其它 https URL 则用自己的列表，输入 `n` = 不启用订阅；
 - **格式**：每行一条规则，`#` 开头整行为注释、空行忽略、不支持行尾注释。裸域名 = 该域名及其全部子域名走 WARP；也支持 Xray 原生前缀 `full:`（精确匹配）、`keyword:`、`regexp:`、`geosite:`；非法行**跳过并记日志**，其余行照常生效；重复行去重；上限 1000 条；
 - **机制**：同步器 `/etc/xray/warp-sync.sh` 由 systemd timer（`xray-warp-sync.timer`，每天一次，随机延迟半小时内；无 systemd 时落 cron）驱动：拉取 → 解析 → 内容与上次相同则什么都不做；变化时把「内置 + 订阅」重写进 `routing`，先 `xray run -test` 校验，通过才重建容器（秒级断线）；校验失败或拉取失败都**保持现有配置**，下轮重试；新容器起不来时按旧配置自动回滚；
 - 装完当场就拉取一次并入首份配置（拉取失败只提示，节点照常装）；重装沿用已装 URL（`XRAY_WARP_LIST` 可覆盖）；**关闭 WARP 时同步器一并移除**；

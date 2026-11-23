@@ -26,6 +26,7 @@
 ## WARP 订阅列表的既定设计（用户确认过）
 
 - 列表源默认本仓库 [warp-domains.txt](../warp-domains.txt) 的 raw URL，**追加**到内置三条 geosite（内置永远在）；每行裸域名或 `full:`/`keyword:`/`regexp:`/`geosite:` 前缀，`#` 只支持整行注释；非法行**跳过并记日志**不清空列表；同步周期 1 天。改这些语义前先问。
+- 交互输入语义（2026-11-23 用户确认，推翻早期「留空=不启用」）：**留空 = 默认列表**（`default_warp_list_url`，重装时即已装 URL），输入 `n` = 不启用订阅，其它输入过 `valid_url`。
 - 同步器是 `render_warp_sync_script` 用带引号 heredoc 内嵌生成的独立脚本（占位符 `__WARP_LIST_URL__` 替换），落到 `/etc/xray/warp-sync.sh`，由 systemd timer（无 systemd 落 cron，行尾 `# xray warp sync` 标记去重）驱动。`update` 子命令不碰同步器。
 - **同步器改配置靠精确缩进截断**：`grep '^  "routing": {$'` 找到脚本生成的 routing 段（config 的最后一个顶层键），`sed '/^  "routing": {$/,$d'` 截掉再追加新 routing + 收尾 `}`。改 `render_config` 的 routing 缩进/位置必须同步改内嵌脚本，否则同步器判定「被手工改过」拒绝工作。
 - 变化判定用**解析后域文的 sha256**（状态文件第 2 行；第 1 行是 URL），不是原始下载内容——改注释不触发重建。任何失败（拉取 / `xray run -test` / 容器起不来）都保持旧配置，容器失败回滚靠 `config.json.before-sync`。重建失败或校验失败一律 `exit 0`（timer 不算 fail），只有回滚类硬失败 `exit 1`。
@@ -36,7 +37,7 @@
 - `ensure_image` 见到本地已有镜像就跳过 `docker pull`，所以**重装不会更新内核与 geosite/geoip**；更新只能走 `update` 子命令，别把 pull 塞回安装路径。
 - `key_from_output` 必须同时认 `Public key` 与新版 `Password` 标签：Xray 26 改了 `xray x25519` 的输出字段名。
 - Xray 的 JSON 配置加载器**忽略未知字段**（实测：往 `realitySettings` 塞不存在的字段仍 `Configuration OK`），所以新字段对旧内核安全，但也意味着拼错字段名不会报错，只能靠断言校验。
-- Clash / mihomo 片段里 `short-id` 必须带引号：纯数字的 hex shortId 不加引号会被 YAML 解析成整数；IPv6 的 `server` 同样加引号，而 `vless://` 链接里的 IPv6 要加 `[]`。
+- Clash / mihomo 片段**所有值一律不加引号**（2026-11-23 用户实测带引号连不上，明确选择全部去掉）。已知代价并已告知用户：纯数字 hex shortId 不带引号会被 YAML 解析成整数、IPv6 server 部分解析器有歧义——用户仍选全去掉，**不要"顺手"加回引号**。`vless://` 链接里的 IPv6 仍要加 `[]`。
 - 从 macOS 本机探测 target 的结果不可信：本机走代理，域名会解析到 `198.18.x` fake-ip，`tls ping` 的成败与真实服务器不同（实测 `www.nvidia.com` 本机握手失败）。候选池必须在目标服务器上复测。
 - 在 harness 里 `source` 脚本副本会连带继承 `set -Eeuo pipefail` 与 ERR trap，测试脚本里断言「某命令应当失败」前必须 `set +e +E; trap - ERR`，否则第一条负面断言就会中断整个测试。
 - 随机化相关的断言不能写死次数/顺序：候选池打乱后「探测了几个」「有没有降级日志」都随顺序变化，断言要写成区间或条件式，否则测试会随机红。
